@@ -1,0 +1,927 @@
+"""
+Little Bighorn — Last Stand  (25 June 1876)
+Engine: Panda3D      pip install panda3d
+
+─────────────────────────────────────────────────────────────
+  DROP MODELS HERE:   models/
+    trooper.glb       Union cavalry soldier
+    horse.glb         War pony
+    warrior.glb       Lakota/Cheyenne rider
+    dead.glb          Fallen figure (optional)
+
+  Where to get free models:
+    • Sketchfab.com  — filter: free + downloadable
+      search "US cavalry", "Native American warrior", "horse"
+    • Mixamo.com     — free rigged humans (needs Blender export)
+    • poly.pizza     — free low-poly models
+
+  If a model file is missing the game falls back to the
+  procedural box-mesh version automatically.
+
+  Per-pixel lighting (render.setShaderAuto) is enabled
+  automatically when any .glb model is loaded.
+─────────────────────────────────────────────────────────────
+
+Controls:
+  W/S        — Move forward / backward
+  A/D        — Strafe left / right
+  Mouse      — Look (captured)
+  Left click — Fire
+  R          — Reload
+  Tab        — Switch weapon  (Carbine ↔ Colt)
+  ESC        — Quit
+"""
+
+from __future__ import annotations
+import math, random, sys, os
+from dataclasses import dataclass
+from typing import List, Optional
+from enum import Enum, auto
+from pathlib import Path
+
+from direct.showbase.ShowBase import ShowBase
+from direct.gui.DirectGui import DirectFrame, OnscreenText, DirectWaitBar
+from direct.task import Task
+from panda3d.core import (
+    Vec3, Vec4, LColor, Point3,
+    GeomNode, Geom, GeomVertexFormat, GeomVertexData,
+    GeomVertexWriter, GeomTriangles,
+    NodePath, AmbientLight, DirectionalLight, Fog,
+    CardMaker, TextureStage,
+    Texture, PNMImage,
+    WindowProperties, TextNode,
+    loadPrcFileData,
+)
+
+loadPrcFileData("", """
+    window-title Little Bighorn - Last Stand (25 June 1876)
+    win-size 1280 800
+    sync-video 0
+    show-frame-rate-meter 0
+    cursor-hidden 1
+    fullscreen 0
+""")
+
+# ── Model folder — sits next to this script ────────────────────────────────────
+SCRIPT_DIR  = Path(__file__).parent
+MODELS_DIR  = SCRIPT_DIR / "models"
+
+# ── Model scale / position corrections ────────────────────────────────────────
+# Tune these per-model after downloading. Values depend on the source file.
+MODEL_CFG = {
+    # key: (scale, z_offset, h_offset)
+    # scale    — uniform scale so the character is ~1.8 units tall
+    # z_offset — raise/lower so feet touch z=0
+    # h_offset — rotate if model faces wrong direction (degrees)
+    "trooper": (1.0,  0.0,  0.0),
+    "horse":   (1.0,  0.0,  0.0),
+    "warrior": (1.0,  0.0,  0.0),
+    "dead":    (1.0,  0.0,  0.0),
+}
+
+# ── Constants ──────────────────────────────────────────────────────────────────
+PLAYER_SPEED   = 8.0
+MOUSE_SENS     = 0.12
+CAM_HEIGHT     = 1.7
+
+CARBINE_DMG    = 90;  CARBINE_RELOAD = 2.8; CARBINE_RANGE = 80.0
+COLT_DMG       = 48;  COLT_RELOAD    = 3.2; COLT_RANGE    = 25.0; COLT_CAP = 6
+
+TROOPER_COUNT  = 14
+TROOPER_RATE   = 1.8
+TROOPER_R      = 0.5
+TROOPER_HP     = 100
+
+ENEMY_HP       = 60;  ENEMY_DMG = 8;   ENEMY_ATK_R  = 1.8
+ENEMY_FIRE_R   = 22.0; ENEMY_RATE = 0.55
+ENEMY_SPD_MIN  = 7.0;  ENEMY_SPD_MAX = 11.0
+ENEMY_R        = 0.8
+
+SPAWN_MIN      = 35.0; SPAWN_MAX  = 60.0
+INIT_ENEMIES   = 25;   WAVE_TIME  = 12.0; WAVE_ADD = 10
+
+GROUND_SIZE    = 220.0
+HILL_COUNT     = 22
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
+def vlen2(x, y): return math.hypot(x, y)
+def vnorm2(x, y):
+    l = vlen2(x, y)
+    return (x/l, y/l) if l > 1e-6 else (0.0, 0.0)
+
+# ── Procedural geometry (fallback when no .glb files present) ─────────────────
+
+def _add_box(vw, nw, cw, cx, cy, cz, sx, sy, sz, r, g, b):
+    hw, hh, hd = sx/2, sy/2, sz/2
+    col = (r/255, g/255, b/255, 1)
+    faces = [
+        (( 0, 0, 1), [(-hw,-hd, hh),( hw,-hd, hh),( hw, hd, hh),(-hw, hd, hh)]),
+        (( 0, 0,-1), [( hw,-hd,-hh),(-hw,-hd,-hh),(-hw, hd,-hh),( hw, hd,-hh)]),
+        (( 1, 0, 0), [( hw,-hd,-hh),( hw, hd,-hh),( hw, hd, hh),( hw,-hd, hh)]),
+        ((-1, 0, 0), [(-hw, hd,-hh),(-hw,-hd,-hh),(-hw,-hd, hh),(-hw, hd, hh)]),
+        (( 0, 1, 0), [(-hw, hd,-hh),( hw, hd,-hh),( hw, hd, hh),(-hw, hd, hh)]),
+        (( 0,-1, 0), [( hw,-hd,-hh),(-hw,-hd,-hh),(-hw,-hd, hh),( hw,-hd, hh)]),
+    ]
+    base = vw.getWriteRow()
+    for (nx, ny, nz), corners in faces:
+        for (dx, dy, dz) in corners:
+            vw.addData3(cx+dx, cz+dy, cy+dz)
+            nw.addData3(nx, ny, nz)
+            cw.addData4(*col)
+    return base
+
+def _add_cyl(vw, nw, cw, cx, cy, cz, radius, height, r, g, b, steps=8):
+    col = (r/255, g/255, b/255, 1)
+    base = vw.getWriteRow()
+    for i in range(steps):
+        a0 = i/steps*math.pi*2; a1 = (i+1)/steps*math.pi*2
+        x0,y0 = math.cos(a0)*radius, math.sin(a0)*radius
+        x1,y1 = math.cos(a1)*radius, math.sin(a1)*radius
+        for (dx,dy,dz,nx,ny) in [
+            (x0,y0,0,x0,y0),(x1,y1,0,x1,y1),
+            (x1,y1,height,x1,y1),(x0,y0,height,x0,y0)]:
+            vw.addData3(cx+dx, cz+dy, cy+dz)
+            nw.addData3(nx, ny, 0)
+            cw.addData4(*col)
+    return base
+
+def _build_mesh(vdata, tris) -> NodePath:
+    geom = Geom(vdata); geom.addPrimitive(tris)
+    node = GeomNode("mesh"); node.addGeom(geom)
+    np = NodePath(node)
+    np.setColorOff(); np.setLightOff()
+    return np
+
+def _new_writers():
+    fmt   = GeomVertexFormat.getV3n3c4()
+    vdata = GeomVertexData("m", fmt, Geom.UHStatic)
+    tris  = GeomTriangles(Geom.UHStatic)
+    vw = GeomVertexWriter(vdata, "vertex")
+    nw = GeomVertexWriter(vdata, "normal")
+    cw = GeomVertexWriter(vdata, "color")
+    return vdata, tris, vw, nw, cw
+
+def _box_tris(tris, base):
+    for f in range(6):
+        b0 = base + f*4
+        tris.addVertices(b0, b0+1, b0+2)
+        tris.addVertices(b0, b0+2, b0+3)
+
+def _cyl_tris(tris, base, steps=8):
+    for i in range(steps):
+        b0 = base + i*4
+        tris.addVertices(b0, b0+1, b0+2)
+        tris.addVertices(b0, b0+2, b0+3)
+
+def make_trooper_model_proc() -> NodePath:
+    vdata, tris, vw, nw, cw = _new_writers()
+    def B(cx,cy,cz,sx,sy,sz,r,g,b): _box_tris(tris, _add_box(vw,nw,cw,cx,cy,cz,sx,sy,sz,r,g,b))
+    def C(cx,cy,cz,rd,h,r,g,b):     _cyl_tris(tris, _add_cyl(vw,nw,cw,cx,cy,cz,rd,h,r,g,b))
+    B(-0.13,0.00,0.0, 0.18,0.28,0.22, 28,18,10); B( 0.13,0.00,0.0, 0.18,0.28,0.22, 28,18,10)
+    B(-0.13,0.28,0.0, 0.20,0.54,0.21, 52,65,88); B( 0.13,0.28,0.0, 0.20,0.54,0.21, 52,65,88)
+    B(-0.22,0.40,0.0, 0.04,0.38,0.04, 180,148,40); B( 0.22,0.40,0.0, 0.04,0.38,0.04, 180,148,40)
+    B( 0.0, 0.82,0.0, 0.48,0.52,0.26, 44,62,82)
+    B( 0.0, 0.80,0.0, 0.50,0.06,0.28, 140,110,35)
+    B(-0.32,0.90,0.0, 0.16,0.46,0.18, 44,62,82); B( 0.32,0.90,0.0, 0.16,0.46,0.18, 44,62,82)
+    C(-0.32,0.84,0.0, 0.09,0.12, 200,165,120); C( 0.32,0.84,0.0, 0.09,0.12, 200,165,120)
+    B( 0.0, 1.06,0.0, 0.16,0.40,0.16, 200,165,120)
+    B( 0.0, 1.46,0.0, 0.28,0.32,0.26, 200,165,120)
+    B( 0.0, 1.78,0.0, 0.42,0.06,0.40, 22,14,8); B( 0.0, 1.84,0.0, 0.26,0.24,0.28, 22,14,8)
+    B( 0.0, 1.78,0.0, 0.28,0.05,0.30, 140,110,35)
+    B( 0.42,0.72,0.0, 0.05,1.05,0.05, 55,42,20)
+    root = _build_mesh(vdata, tris); root.setTwoSided(False)
+    return root
+
+def make_horse_model_proc() -> NodePath:
+    vdata, tris, vw, nw, cw = _new_writers()
+    def B(cx,cy,cz,sx,sy,sz,r,g,b): _box_tris(tris, _add_box(vw,nw,cw,cx,cy,cz,sx,sy,sz,r,g,b))
+    HC=(110,70,30); HM=(35,20,10)
+    B( 0.0,1.15, 0.0, 0.55,0.70,1.40,*HC); B( 0.0,1.25,-0.55,0.50,0.55,0.50,*HC)
+    B( 0.0,1.10, 0.60,0.48,0.55,0.30,*HC); B( 0.0,1.55, 0.52,0.28,0.60,0.28,*HC)
+    B( 0.0,1.60, 0.88,0.22,0.26,0.50,*HC); B( 0.0,1.48, 1.04,0.16,0.16,0.24, HC[0]-10,HC[1]-5,HC[2]-5)
+    B(-0.09,1.82,0.82,0.06,0.14,0.06,*HM); B( 0.09,1.82,0.82,0.06,0.14,0.06,*HM)
+    B( 0.0,1.72, 0.60,0.08,0.28,0.38,*HM)
+    B(-0.18,0.56, 0.32,0.16,1.12,0.18,HC[0]-8,HC[1]-4,HC[2]-4)
+    B( 0.18,0.56, 0.32,0.16,1.12,0.18,HC[0]-8,HC[1]-4,HC[2]-4)
+    B(-0.18,0.56,-0.40,0.16,1.12,0.18,HC[0]-8,HC[1]-4,HC[2]-4)
+    B( 0.18,0.56,-0.40,0.16,1.12,0.18,HC[0]-8,HC[1]-4,HC[2]-4)
+    B(-0.18,0.08, 0.32,0.17,0.16,0.19,*HM); B( 0.18,0.08, 0.32,0.17,0.16,0.19,*HM)
+    B(-0.18,0.08,-0.40,0.17,0.16,0.19,*HM); B( 0.18,0.08,-0.40,0.17,0.16,0.19,*HM)
+    B( 0.0,1.20,-0.82,0.10,0.60,0.12,*HM)
+    B( 0.0,1.85, 0.0, 0.56,0.08,0.70, 160,40,20)
+    root = _build_mesh(vdata, tris); root.setTwoSided(False)
+    return root
+
+def make_warrior_model_proc() -> NodePath:
+    vdata, tris, vw, nw, cw = _new_writers()
+    def B(cx,cy,cz,sx,sy,sz,r,g,b): _box_tris(tris, _add_box(vw,nw,cw,cx,cy,cz,sx,sy,sz,r,g,b))
+    def C(cx,cy,cz,rd,h,r,g,b):     _cyl_tris(tris, _add_cyl(vw,nw,cw,cx,cy,cz,rd,h,r,g,b))
+    SK=(155,96,48); TN=(130,80,40)
+    B( 0.0,0.10,0.0,0.38,0.24,0.28,TN[0]-10,TN[1]-5,TN[2]-5)
+    B( 0.0,0.46,0.0,0.44,0.48,0.24,*TN)
+    B(-0.28,0.52,0.08,0.14,0.42,0.16,*TN); B( 0.28,0.62,0.0,0.14,0.56,0.16,*TN)
+    C(-0.28,0.48,0.08,0.08,0.10,*SK); C( 0.28,0.78,0.0,0.08,0.10,*SK)
+    B( 0.0,0.94,0.0,0.14,0.28,0.14,*SK)
+    B( 0.0,1.22,0.0,0.26,0.30,0.24,*SK)
+    B( 0.0,1.50,0.0,0.28,0.08,0.26,25,15,8)
+    B(-0.14,1.16,0.0,0.06,0.44,0.06,25,15,8); B( 0.14,1.16,0.0,0.06,0.44,0.06,25,15,8)
+    B( 0.10,1.58,0.0,0.04,0.28,0.04,180,40,20); B( 0.10,1.86,0.0,0.04,0.12,0.04,220,200,180)
+    B( 0.36,0.72,0.04,0.06,0.52,0.06,68,48,22)
+    B( 0.36,0.98,0.04,0.06,0.18,0.08,52,48,44)
+    B( 0.36,1.22,0.04,0.04,0.60,0.04,38,35,32)
+    root = _build_mesh(vdata, tris); root.setTwoSided(False)
+    return root
+
+def make_dead_model_proc() -> NodePath:
+    vdata, tris, vw, nw, cw = _new_writers()
+    _box_tris(tris, _add_box(vw,nw,cw,0,0.06,0,1.2,0.14,0.5,60,38,18))
+    return _build_mesh(vdata, tris)
+
+
+# ── Terrain ────────────────────────────────────────────────────────────────────
+
+def make_grass_texture(w=256, h=256) -> Texture:
+    img = PNMImage(w, h)
+    rng = random.Random(7)
+    for y in range(h):
+        for x in range(w):
+            r = 0.38 + rng.uniform(-0.05, 0.07)
+            g = 0.33 + rng.uniform(-0.04, 0.05)
+            b = 0.14 + rng.uniform(-0.02, 0.03)
+            img.setXel(x, y, r, g, b)
+    for _ in range(1200):
+        tx=rng.randint(0,w-1); ty=rng.randint(0,h-1)
+        img.setXel(tx,ty,img.getRed(tx,ty)*0.65,img.getGreen(tx,ty)*0.65,img.getBlue(tx,ty)*0.65)
+    tex = Texture("grass"); tex.load(img)
+    tex.setWrapU(Texture.WMRepeat); tex.setWrapV(Texture.WMRepeat)
+    tex.setMinfilter(Texture.FTLinearMipmapLinear)
+    return tex
+
+def make_hill_texture(w=128, h=128) -> Texture:
+    img = PNMImage(w, h)
+    rng = random.Random(13)
+    for y in range(h):
+        for x in range(w):
+            img.setXel(x, y,
+                0.32+rng.uniform(-0.04,0.04),
+                0.27+rng.uniform(-0.03,0.03),
+                0.12+rng.uniform(-0.02,0.02))
+    tex = Texture("hill"); tex.load(img)
+    tex.setWrapU(Texture.WMRepeat); tex.setWrapV(Texture.WMRepeat)
+    return tex
+
+def make_ground_node(size, tex) -> NodePath:
+    cm = CardMaker("ground")
+    cm.setFrame(-size/2, size/2, -size/2, size/2)
+    np = NodePath(cm.generate())
+    np.setP(-90); np.setTexture(tex)
+    np.setTexScale(TextureStage.getDefault(), size/10, size/10)
+    np.setColor(0.38, 0.33, 0.18, 1)
+    return np
+
+def make_hill_geom(cx, cz, rx, rz, h, tex, seed) -> NodePath:
+    rng = random.Random(seed); steps=28
+    fmt = GeomVertexFormat.getV3n3t2()
+    vdata = GeomVertexData("hill",fmt,Geom.UHStatic); vdata.setNumRows(steps+2)
+    vw=GeomVertexWriter(vdata,"vertex"); nw=GeomVertexWriter(vdata,"normal")
+    tw=GeomVertexWriter(vdata,"texcoord")
+    vw.addData3(cx+rng.uniform(-rx*.08,rx*.08),h,cz+rng.uniform(-rz*.08,rz*.08))
+    nw.addData3(0,1,0); tw.addData2(0.5,0.5)
+    for i in range(steps+1):
+        a=i/steps*math.pi*2
+        bx=cx+math.cos(a)*rx*rng.uniform(0.82,1.0); bz=cz+math.sin(a)*rz*rng.uniform(0.82,1.0)
+        vw.addData3(bx,0.0,bz); nw.addData3(0,1,0)
+        tw.addData2(0.5+math.cos(a)*0.5,0.5+math.sin(a)*0.5)
+    tris=GeomTriangles(Geom.UHStatic)
+    for i in range(1,steps+1): tris.addVertices(0,i,i+1)
+    geom=Geom(vdata); geom.addPrimitive(tris)
+    node=GeomNode("hill"); node.addGeom(geom)
+    np=NodePath(node); np.setTexture(tex); np.setColor(0.30,0.25,0.11,1)
+    return np
+
+def make_grass_tufts(size, count=600) -> NodePath:
+    vdata, tris, vw, nw, cw = _new_writers()
+    rng=random.Random(55)
+    for _ in range(count):
+        x=rng.uniform(-size/2,size/2); z=rng.uniform(-size/2,size/2)
+        h2=rng.uniform(0.12,0.35); w2=rng.uniform(0.04,0.10)
+        r=rng.uniform(0.28,0.42); g=rng.uniform(0.24,0.36); b=rng.uniform(0.08,0.16)
+        for ang in [0, math.pi/2]:
+            dx=math.cos(ang)*w2; dz=math.sin(ang)*w2
+            base=vw.getWriteRow()
+            for (vx,vy,vz) in [(x-dx,z-dz,0),(x+dx,z+dz,0),(x+dx,z+dz,h2),(x-dx,z-dz,h2)]:
+                vw.addData3(vx,vy,vz); nw.addData3(0,0,1); cw.addData4(r,g,b,1)
+            tris.addVertices(base,base+1,base+2); tris.addVertices(base,base+2,base+3)
+    np=_build_mesh(vdata,tris); np.setTwoSided(True)
+    return np
+
+def make_river_segment() -> NodePath:
+    vdata, tris, vw, nw, cw = _new_writers()
+    base=vw.getWriteRow()
+    for (vx,vy,vz) in [(-80,-30,0.02),(80,-28,0.02),(80,-22,0.02),(-80,-24,0.02)]:
+        vw.addData3(vx,vy,vz); nw.addData3(0,0,1); cw.addData4(0.30,0.38,0.48,1)
+    tris.addVertices(base,base+1,base+2); tris.addVertices(base,base+2,base+3)
+    np=_build_mesh(vdata,tris); np.setTwoSided(True)
+    return np
+
+def make_muzzle_flash() -> NodePath:
+    vdata, tris, vw, nw, cw = _new_writers()
+    base=vw.getWriteRow()
+    for (vx,vy,vz) in [(-0.18,-0.18,0),(0.18,-0.18,0),(0.18,0.18,0),(-0.18,0.18,0)]:
+        vw.addData3(vx,vy,vz); nw.addData3(0,-1,0); cw.addData4(1.0,0.85,0.15,1)
+    tris.addVertices(base,base+1,base+2); tris.addVertices(base,base+2,base+3)
+    np=_build_mesh(vdata,tris); np.setTwoSided(True); np.setBillboardPointEye()
+    return np
+
+
+# ── Dust ───────────────────────────────────────────────────────────────────────
+
+@dataclass
+class DustPuff:
+    np: NodePath
+    vx: float; vy: float; vz: float
+    life: float; max_life: float
+
+def spawn_dust(parent: NodePath, x: float, y: float) -> DustPuff:
+    vdata, tris, vw, nw, cw = _new_writers()
+    base=vw.getWriteRow(); s=random.uniform(0.15,0.40)
+    for (vx,vy,vz) in [(-s,-s,0),(s,-s,0),(s,s,0),(-s,s,0)]:
+        vw.addData3(vx,vy,vz); nw.addData3(0,-1,0); cw.addData4(0.60,0.52,0.36,0.7)
+    tris.addVertices(base,base+1,base+2); tris.addVertices(base,base+2,base+3)
+    np=_build_mesh(vdata,tris); np.setTwoSided(True); np.setBillboardPointEye()
+    np.reparentTo(parent)
+    np.setPos(x+random.uniform(-0.5,0.5),y+random.uniform(-0.5,0.5),random.uniform(0.1,0.8))
+    lt=random.uniform(0.4,1.0)
+    return DustPuff(np=np,vx=random.uniform(-0.4,0.4),vy=random.uniform(-0.4,0.4),
+                    vz=random.uniform(0.3,0.8),life=lt,max_life=lt)
+
+
+# ── Entities ───────────────────────────────────────────────────────────────────
+
+class WeaponType(Enum):
+    CARBINE = auto(); COLT = auto()
+
+@dataclass
+class Bullet:
+    x:float; y:float; dx:float; dy:float
+    speed:float=30.0; damage:int=80; range:float=60.0
+    dist:float=0.0; alive:bool=True; is_enemy:bool=False
+
+@dataclass
+class TrooperEnt:
+    x:float; y:float
+    health:int=TROOPER_HP; alive:bool=True
+    fire_timer:float=0.0; np:Optional[NodePath]=None
+
+@dataclass
+class EnemyEnt:
+    x:float; y:float
+    health:int=ENEMY_HP; alive:bool=True
+    speed:float=9.0; fire_timer:float=0.0
+    state:str="charge"; np:Optional[NodePath]=None
+    dust_timer:float=0.0
+
+
+# ── Game ───────────────────────────────────────────────────────────────────────
+
+class LittleBighornGame(ShowBase):
+
+    def __init__(self):
+        super().__init__()
+        props = WindowProperties()
+        props.setMouseMode(WindowProperties.MConfined)
+        props.setCursorHidden(True)
+        self.win.requestProperties(props)
+        self.disableMouse()
+
+        self.camera.setPos(0,0,CAM_HEIGHT)
+        self._yaw=0.0; self._pitch=0.0
+        self._last_mx=None; self._last_my=None
+
+        # ── Lighting ──────────────────────────────────────────────────────────
+        sun=DirectionalLight("sun"); sun.setColor(LColor(1.0,0.92,0.72,1))
+        sun_np=self.render.attachNewNode(sun); sun_np.setHpr(215,-48,0)
+        self.render.setLight(sun_np)
+
+        fill=DirectionalLight("fill"); fill.setColor(LColor(0.32,0.28,0.18,1))
+        fill_np=self.render.attachNewNode(fill); fill_np.setHpr(35,20,0)
+        self.render.setLight(fill_np)
+
+        amb=AmbientLight("amb"); amb.setColor(LColor(0.18,0.16,0.12,1))
+        amb_np=self.render.attachNewNode(amb); self.render.setLight(amb_np)
+
+        # ── Fog ───────────────────────────────────────────────────────────────
+        fog=Fog("haze"); fog.setColor(0.58,0.52,0.38)
+        fog.setLinearRange(30.0,160.0); self.render.setFog(fog)
+
+        self.setBackgroundColor(0.46,0.52,0.62)
+
+        # ── Load / cache 3D models ────────────────────────────────────────────
+        self._using_assets = False
+        self._mdl_cache: dict = {}
+        self._load_models()
+
+        # ── Terrain ───────────────────────────────────────────────────────────
+        self._tex_grass=make_grass_texture(); self._tex_hill=make_hill_texture()
+        self._build_world()
+
+        # ── Dust + muzzle flash ───────────────────────────────────────────────
+        self._dust_root=self.render.attachNewNode("dust")
+        self._dust_puffs: List[DustPuff]=[]
+        self._muzzle_np=make_muzzle_flash(); self._muzzle_np.reparentTo(self.camera)
+        self._muzzle_np.setPos(0.35,2.8,-0.15); self._muzzle_np.hide()
+        self._muzzle_t=0.0
+
+        # ── State + HUD ───────────────────────────────────────────────────────
+        self._state="title"; self._setup_game_state(); self._build_hud()
+
+        # ── Input ─────────────────────────────────────────────────────────────
+        self.accept("escape",self._on_escape); self.accept("r",self._on_reload)
+        self.accept("tab",self._on_switch_weapon)
+        self.accept("space",self._on_fire_key); self.accept("mouse1",self._on_fire_key)
+        self.accept("space-up",self._clear_fire); self.accept("mouse1-up",self._clear_fire)
+        self._keys={"w":False,"s":False,"a":False,"d":False}
+        for k in self._keys:
+            self.accept(k,       lambda key=k: self._key_down(key))
+            self.accept(k+"-up", lambda key=k: self._key_up(key))
+        self._fire_held=False
+        self.taskMgr.add(self._update_task,"update")
+        self._show_title()
+
+    # ── Asset loading ──────────────────────────────────────────────────────────
+
+    def _load_models(self):
+        """Try to load .glb models from the models/ folder.
+           Falls back to procedural meshes if files are missing."""
+        MODELS_DIR.mkdir(exist_ok=True)
+
+        found_any = False
+        for key in ("trooper","horse","warrior","dead"):
+            # Try several extensions in priority order
+            for ext in (".glb",".gltf",".egg",".bam",".obj"):
+                path = MODELS_DIR / (key + ext)
+                if path.exists():
+                    try:
+                        mdl = self.loader.loadModel(str(path))
+                        if mdl:
+                            scale, z_off, h_off = MODEL_CFG.get(key,(1.0,0.0,0.0))
+                            mdl.setScale(scale)
+                            mdl.setZ(z_off)
+                            mdl.setH(h_off)
+                            self._mdl_cache[key] = mdl
+                            mdl.detachNode()   # keep in cache, not in scene
+                            found_any = True
+                            print(f"[assets] Loaded {key} from {path.name}")
+                            break
+                    except Exception as e:
+                        print(f"[assets] Failed to load {path.name}: {e}")
+
+        if found_any:
+            self._using_assets = True
+            # Enable per-pixel lighting — transforms how shading looks on real meshes
+            self.render.setShaderAuto()
+            print("[assets] Per-pixel shader enabled")
+        else:
+            print("[assets] No models found in models/ — using procedural geometry")
+            print(f"[assets] Drop .glb files into: {MODELS_DIR}")
+
+    def _instance_model(self, key: str, parent: NodePath,
+                        fallback_fn) -> NodePath:
+        """Return a fresh instance of a model, or build procedural fallback."""
+        if key in self._mdl_cache:
+            inst = self._mdl_cache[key].copyTo(parent)
+            return inst
+        else:
+            mdl = fallback_fn()
+            mdl.reparentTo(parent)
+            return mdl
+
+    def _make_trooper(self, parent: NodePath) -> NodePath:
+        return self._instance_model("trooper", parent, make_trooper_model_proc)
+
+    def _make_enemy(self, parent: NodePath) -> NodePath:
+        """Mounted enemy: horse + warrior rider, or single warrior fallback."""
+        root = parent.attachNewNode("mounted")
+        if "horse" in self._mdl_cache and "warrior" in self._mdl_cache:
+            horse  = self._mdl_cache["horse"].copyTo(root)
+            rider  = self._mdl_cache["warrior"].copyTo(root)
+            # Rider sits on horse — adjust z so rider is on the saddle
+            # Tune MODEL_CFG["warrior"] z_offset if needed for your specific model
+            rider.setZ(rider.getZ() + 1.85)
+        elif "horse" in self._mdl_cache:
+            # Horse only, add procedural warrior on top
+            horse = self._mdl_cache["horse"].copyTo(root)
+            rider = make_warrior_model_proc(); rider.reparentTo(root)
+            rider.setZ(1.85)
+        else:
+            # Full procedural fallback
+            horse  = make_horse_model_proc();   horse.reparentTo(root)
+            rider  = make_warrior_model_proc(); rider.reparentTo(root)
+            rider.setZ(1.85)
+        return root
+
+    def _make_dead(self, parent: NodePath) -> NodePath:
+        return self._instance_model("dead", parent, make_dead_model_proc)
+
+    # ── World ──────────────────────────────────────────────────────────────────
+
+    def _build_world(self):
+        self._world_np=self.render.attachNewNode("world")
+        ground=make_ground_node(GROUND_SIZE,self._tex_grass)
+        ground.reparentTo(self._world_np)
+        rng=random.Random(42)
+        for i in range(HILL_COUNT):
+            ang=rng.uniform(0,math.pi*2); dist=rng.uniform(18,75)
+            cx=math.cos(ang)*dist; cz=math.sin(ang)*dist
+            rx=rng.uniform(6,16); rz=rng.uniform(4,11); h=rng.uniform(2.5,8.0)
+            hn=make_hill_geom(cx,cz,rx,rz,h,self._tex_hill,seed=i*17)
+            hn.reparentTo(self._world_np)
+        tufts=make_grass_tufts(GROUND_SIZE,count=700); tufts.reparentTo(self._world_np)
+        river=make_river_segment(); river.reparentTo(self._world_np)
+
+    def _clear_entities(self):
+        if hasattr(self,"_entity_root"): self._entity_root.removeNode()
+        self._entity_root=self.render.attachNewNode("entities")
+        for d in self._dust_puffs:
+            if d.np and not d.np.isEmpty(): d.np.removeNode()
+        self._dust_puffs.clear()
+
+    # ── Game state ─────────────────────────────────────────────────────────────
+
+    def _setup_game_state(self):
+        self._cam_x=0.0; self._cam_z=0.0; self._yaw=0.0; self._pitch=0.0
+        self._hp=100; self._kills=0; self._elapsed=0.0; self._wave=1; self._wave_t=0.0
+        self._weapon=WeaponType.CARBINE
+        self._carb_loaded=1; self._carb_ammo=55
+        self._colt_loaded=COLT_CAP; self._colt_ammo=24
+        self._reload_t=0.0; self._reload_time=0.0; self._reloading=False; self._fire_cd=0.0
+        self._bullets: List[Bullet]=[]; self._troopers: List[TrooperEnt]=[]
+        self._enemies: List[EnemyEnt]=[]
+
+    def _start_game(self):
+        self._setup_game_state(); self._clear_entities()
+        rng=random.Random(99)
+        for i in range(TROOPER_COUNT):
+            ang=i/TROOPER_COUNT*math.pi*2; d=rng.uniform(2.5,5.0)
+            tx=math.cos(ang)*d; tz=math.sin(ang)*d
+            mdl=self._make_trooper(self._entity_root); mdl.setPos(tx,tz,0)
+            self._troopers.append(TrooperEnt(x=tx,y=tz,np=mdl))
+        self._spawn_wave(INIT_ENEMIES)
+        self._cam_x=0.0; self._cam_z=0.0; self._yaw=0.0; self._pitch=0.0
+        self.camera.setPos(0,0,CAM_HEIGHT); self.camera.setHpr(0,0,0)
+        if self.mouseWatcherNode.hasMouse():
+            self.win.movePointer(0,self.win.getXSize()//2,self.win.getYSize()//2)
+        self._update_hud_weapon()
+
+    def _spawn_wave(self, count):
+        rng=random.Random(int(self._elapsed*100)+len(self._enemies))
+        for _ in range(count):
+            ang=rng.uniform(0,math.pi*2); dist=rng.uniform(SPAWN_MIN,SPAWN_MAX)
+            ex=self._cam_x+math.cos(ang)*dist; ez=self._cam_z+math.sin(ang)*dist
+            spd=rng.uniform(ENEMY_SPD_MIN,ENEMY_SPD_MAX)*(1+self._wave*0.07)
+            mdl=self._make_enemy(self._entity_root); mdl.setPos(ex,ez,0)
+            self._enemies.append(EnemyEnt(x=ex,y=ez,speed=spd,np=mdl))
+
+    # ── Input ──────────────────────────────────────────────────────────────────
+
+    def _key_down(self,k): self._keys[k]=True
+    def _key_up(self,k):   self._keys[k]=False
+    def _on_fire_key(self): self._fire_held=True
+    def _clear_fire(self):  self._fire_held=False
+
+    def _on_escape(self):
+        if self._state=="playing": self._state="title"; self._show_title()
+        else: self.destroy(); sys.exit()
+
+    def _on_reload(self):
+        if self._state!="playing" or self._reloading: return
+        if self._weapon==WeaponType.CARBINE and self._carb_ammo<=0: return
+        if self._weapon==WeaponType.COLT    and self._colt_ammo<=0: return
+        self._reload_time=(CARBINE_RELOAD if self._weapon==WeaponType.CARBINE else COLT_RELOAD)
+        self._reload_t=0.0; self._reloading=True
+
+    def _on_switch_weapon(self):
+        if self._state!="playing" or self._reloading: return
+        self._weapon=(WeaponType.COLT if self._weapon==WeaponType.CARBINE else WeaponType.CARBINE)
+        self._update_hud_weapon()
+
+    def _try_fire(self):
+        if self._reloading or self._fire_cd>0: return
+        if self._weapon==WeaponType.CARBINE:
+            if self._carb_loaded<=0: self._on_reload(); return
+            self._carb_loaded-=1; dmg=CARBINE_DMG; rng_w=CARBINE_RANGE; self._fire_cd=0.55
+        else:
+            if self._colt_loaded<=0: self._on_reload(); return
+            self._colt_loaded-=1; dmg=COLT_DMG; rng_w=COLT_RANGE; self._fire_cd=0.18
+        sp=0.03 if self._weapon==WeaponType.CARBINE else 0.07
+        yaw_r=math.radians(self._yaw)
+        dx=-math.sin(yaw_r)+random.gauss(0,sp); dy=math.cos(yaw_r)+random.gauss(0,sp)
+        dx,dy=vnorm2(dx,dy)
+        self._bullets.append(Bullet(x=self._cam_x+dx*0.9,y=self._cam_z+dy*0.9,
+                                     dx=dx,dy=dy,speed=42.0,damage=dmg,range=rng_w))
+        self._muzzle_np.show(); self._muzzle_t=0.08
+        for _ in range(2):
+            p=spawn_dust(self._dust_root,self._cam_x+dx*1.0,self._cam_z+dy*1.0)
+            p.np.setColor(0.72,0.68,0.58,0.6); self._dust_puffs.append(p)
+        self._update_hud_ammo()
+
+    # ── Update ─────────────────────────────────────────────────────────────────
+
+    def _update_task(self, task):
+        dt=min(globalClock.getDt(),0.05)
+        if self._state in ("title","gameover"): return Task.cont
+
+        # Mouse look
+        if self.mouseWatcherNode.hasMouse():
+            mx=self.mouseWatcherNode.getMouseX(); my=self.mouseWatcherNode.getMouseY()
+            if self._last_mx is not None:
+                self._yaw  -=(mx-self._last_mx)*MOUSE_SENS*100
+                self._pitch  =max(-80,min(80,self._pitch+(my-self._last_my)*MOUSE_SENS*80))
+            self._last_mx=mx; self._last_my=my
+            cx=self.win.getXSize()//2; cy=self.win.getYSize()//2
+            self.win.movePointer(0,cx,cy); self._last_mx=0.0; self._last_my=0.0
+        self.camera.setHpr(self._yaw,self._pitch,0)
+
+        # Movement
+        yaw_r=math.radians(self._yaw)
+        fwd_x=-math.sin(yaw_r); fwd_z=math.cos(yaw_r)
+        rgt_x=fwd_z; rgt_z=-fwd_x
+        mv_x=mv_z=0.0
+        if self._keys["w"]: mv_x+=fwd_x; mv_z+=fwd_z
+        if self._keys["s"]: mv_x-=fwd_x; mv_z-=fwd_z
+        if self._keys["a"]: mv_x-=rgt_x; mv_z-=rgt_z
+        if self._keys["d"]: mv_x+=rgt_x; mv_z+=rgt_z
+        if mv_x or mv_z:
+            nmx,nmz=vnorm2(mv_x,mv_z)
+            self._cam_x+=nmx*PLAYER_SPEED*dt; self._cam_z+=nmz*PLAYER_SPEED*dt
+            if random.random()<0.15:
+                self._dust_puffs.append(spawn_dust(self._dust_root,self._cam_x,self._cam_z))
+        self.camera.setPos(self._cam_x,self._cam_z,CAM_HEIGHT)
+
+        # Muzzle flash
+        if self._muzzle_t>0:
+            self._muzzle_t=max(0.0,self._muzzle_t-dt)
+            if self._muzzle_t<=0: self._muzzle_np.hide()
+
+        # Fire / reload
+        self._fire_cd=max(0.0,self._fire_cd-dt)
+        if self._fire_held: self._try_fire()
+        if self._reloading:
+            self._reload_t+=dt
+            self._hud_reload_bar["value"]=self._reload_t/self._reload_time*100
+            if self._reload_t>=self._reload_time:
+                self._reloading=False; self._reload_t=0.0; self._hud_reload_bar["value"]=0
+                if self._weapon==WeaponType.CARBINE:
+                    add=min(self._carb_ammo,1); self._carb_loaded=add; self._carb_ammo-=add
+                else:
+                    add=min(self._colt_ammo,COLT_CAP-self._colt_loaded)
+                    self._colt_loaded+=add; self._colt_ammo-=add
+                self._update_hud_ammo()
+
+        # Dust
+        alive_dust=[]
+        for p in self._dust_puffs:
+            if p.np.isEmpty(): continue
+            p.life-=dt
+            if p.life<=0: p.np.removeNode(); continue
+            t=p.life/p.max_life
+            px2,py2,pz2=p.np.getPos()
+            p.np.setPos(px2+p.vx*dt,py2+p.vy*dt,pz2+p.vz*dt)
+            p.np.setAlphaScale(t*0.8); s=1.0+(1.0-t)*1.5; p.np.setScale(s)
+            alive_dust.append(p)
+        self._dust_puffs=alive_dust
+
+        # Bullets
+        for b in self._bullets:
+            b.x+=b.dx*b.speed*dt; b.y+=b.dy*b.speed*dt; b.dist+=b.speed*dt
+            if b.dist>b.range: b.alive=False; continue
+            if not b.is_enemy:
+                for e in self._enemies:
+                    if not e.alive: continue
+                    if vlen2(b.x-e.x,b.y-e.y)<ENEMY_R*1.5:
+                        e.health-=b.damage; b.alive=False
+                        if e.health<=0:
+                            e.alive=False; self._kills+=1
+                            if e.np:
+                                e.np.removeNode(); e.np=None
+                                dead=self._make_dead(self._entity_root)
+                                dead.setPos(e.x,e.y,0); dead.setH(random.uniform(0,360))
+                        break
+            else:
+                if vlen2(b.x-self._cam_x,b.y-self._cam_z)<0.9:
+                    self._hp-=b.damage; b.alive=False
+                    if self._hp<=0: self._state="gameover"; self._show_gameover()
+                    continue
+                for t in self._troopers:
+                    if not t.alive: continue
+                    if vlen2(b.x-t.x,b.y-t.y)<TROOPER_R*1.5:
+                        t.health-=b.damage; b.alive=False
+                        if t.health<=0:
+                            t.alive=False
+                            if t.np:
+                                t.np.removeNode(); t.np=None
+                                dead=self._make_dead(self._entity_root)
+                                dead.setPos(t.x,t.y,0)
+                        break
+        self._bullets=[b for b in self._bullets if b.alive]
+
+        # Enemy AI
+        alive_e=[e for e in self._enemies if e.alive]
+        for e in alive_e:
+            dx=self._cam_x-e.x; dz=self._cam_z-e.y; dist=vlen2(dx,dz)
+            if e.state=="flank":
+                p2x,p2z=-dz/max(0.1,dist),dx/max(0.1,dist)
+                dx=dx*0.5+p2x*0.5; dz=dz*0.5+p2z*0.5
+            if dist>ENEMY_ATK_R:
+                nx,nz=vnorm2(dx,dz); e.x+=nx*e.speed*dt; e.y+=nz*e.speed*dt
+                if e.np:
+                    e.np.setPos(e.x,e.y,0)
+                    face=math.degrees(math.atan2(-dx,-dz)); e.np.setH(face)
+                e.dust_timer+=dt
+                if e.dust_timer>0.12:
+                    e.dust_timer=0.0
+                    self._dust_puffs.append(spawn_dust(self._dust_root,e.x,e.y))
+            if dist<ENEMY_ATK_R:
+                self._hp-=int(ENEMY_DMG*dt*2.5)
+                if self._hp<=0: self._state="gameover"; self._show_gameover()
+            e.fire_timer+=dt
+            if e.fire_timer>=1.0/ENEMY_RATE:
+                e.fire_timer=0.0
+                if dist<ENEMY_FIRE_R and random.random()<0.40:
+                    edx=self._cam_x-e.x+random.gauss(0,0.5)
+                    edz=self._cam_z-e.y+random.gauss(0,0.5)
+                    edx,edz=vnorm2(edx,edz)
+                    self._bullets.append(Bullet(x=e.x+edx*0.6,y=e.y+edz*0.6,
+                        dx=edx,dy=edz,speed=20.0,damage=ENEMY_DMG,
+                        range=ENEMY_FIRE_R,is_enemy=True))
+            if random.random()<0.002:
+                e.state="charge" if e.state=="flank" else "flank"
+
+        for t in self._troopers:
+            if not t.alive: continue
+            for e in alive_e:
+                if vlen2(e.x-t.x,e.y-t.y)<TROOPER_R+ENEMY_R+0.4:
+                    t.health-=int(ENEMY_DMG*dt*2.0)
+                    if t.health<=0:
+                        t.alive=False
+                        if t.np:
+                            t.np.removeNode(); t.np=None
+                            dead=self._make_dead(self._entity_root)
+                            dead.setPos(t.x,t.y,0)
+                    break
+
+        for t in self._troopers:
+            if not t.alive or not alive_e: continue
+            t.fire_timer+=dt
+            if t.fire_timer>=1.0/TROOPER_RATE:
+                t.fire_timer=0.0
+                tgt=min(alive_e,key=lambda e:vlen2(e.x-t.x,e.y-t.y))
+                if vlen2(tgt.x-t.x,tgt.y-t.y)>38: continue
+                tdx,tdz=vnorm2(tgt.x-t.x,tgt.y-t.y)
+                tdx+=random.gauss(0,0.07); tdz+=random.gauss(0,0.07)
+                tdx,tdz=vnorm2(tdx,tdz)
+                self._bullets.append(Bullet(x=t.x+tdx*0.5,y=t.y+tdz*0.5,
+                    dx=tdx,dy=tdz,speed=38.0,damage=CARBINE_DMG,range=CARBINE_RANGE))
+                self._dust_puffs.append(spawn_dust(self._dust_root,t.x,t.y))
+
+        self._elapsed+=dt; self._wave_t+=dt
+        if self._wave_t>=WAVE_TIME:
+            self._wave_t=0.0; self._wave+=1
+            self._spawn_wave(WAVE_ADD+self._wave*2)
+
+        self._update_hud_dynamic()
+        return Task.cont
+
+    # ── HUD ────────────────────────────────────────────────────────────────────
+
+    def _build_hud(self):
+        self._hud_time=OnscreenText(text="",pos=(0,0.92),scale=0.045,
+            fg=(0.82,0.74,0.54,1),shadow=(0,0,0,0.6),mayChange=True,align=TextNode.ACenter)
+        self._hud_health_bar=DirectWaitBar(text="",value=100,range=100,
+            pos=(-1.1,0,-0.82),frameSize=(0,0.7,-0.025,0.025),
+            frameColor=(0.22,0.08,0.06,0.9),barColor=(0.32,0.78,0.22,1))
+        self._hud_health_lbl=OnscreenText(text="HEALTH",pos=(-1.10,-0.775),scale=0.038,
+            fg=(0.65,0.55,0.40,1),shadow=(0,0,0,0.5),align=TextNode.ALeft)
+        self._hud_troopers=OnscreenText(text="",pos=(-1.10,-0.875),scale=0.040,
+            fg=(0.72,0.64,0.44,1),shadow=(0,0,0,0.5),mayChange=True,align=TextNode.ALeft)
+        self._hud_weapon=OnscreenText(text="Springfield Carbine",pos=(0,-0.80),scale=0.052,
+            fg=(0.72,0.58,0.20,1),shadow=(0,0,0,0.6),mayChange=True,align=TextNode.ACenter)
+        self._hud_ammo=OnscreenText(text="",pos=(0,-0.855),scale=0.048,
+            fg=(0.94,0.92,0.86,1),shadow=(0,0,0,0.6),mayChange=True,align=TextNode.ACenter)
+        self._hud_ammo_res=OnscreenText(text="",pos=(0,-0.905),scale=0.038,
+            fg=(0.65,0.58,0.40,1),shadow=(0,0,0,0.5),mayChange=True,align=TextNode.ACenter)
+        self._hud_reload_bar=DirectWaitBar(text="RELOADING",value=0,range=100,
+            pos=(0,0,-0.945),frameSize=(-0.25,0.25,-0.018,0.018),
+            frameColor=(0.18,0.14,0.06,0.85),barColor=(0.72,0.58,0.20,1))
+        self._hud_kills=OnscreenText(text="0",pos=(1.12,-0.78),scale=0.10,
+            fg=(0.70,0.16,0.09,1),shadow=(0,0,0,0.6),mayChange=True,align=TextNode.ARight)
+        self._hud_kills_lbl=OnscreenText(text="enemies fallen",pos=(1.12,-0.855),scale=0.038,
+            fg=(0.65,0.55,0.40,1),shadow=(0,0,0,0.5),align=TextNode.ARight)
+        self._hud_wave=OnscreenText(text="Wave 1",pos=(1.12,-0.900),scale=0.040,
+            fg=(0.80,0.63,0.30,1),shadow=(0,0,0,0.5),mayChange=True,align=TextNode.ARight)
+        ch=(0.88,0.84,0.72,0.85)
+        self._ch=[OnscreenText(text=t,pos=p,scale=0.04,fg=ch) for t,p in
+                  [("─",(-0.04,0)),("─",(0.04,0)),("│",(0,-0.025)),("│",(0,0.025))]]
+        self._hud_hint=OnscreenText(
+            text="[Tab] switch weapon   [R] reload   Mouse = look",
+            pos=(0,-0.960),scale=0.033,fg=(0.50,0.44,0.32,0.8),
+            shadow=(0,0,0,0.4),align=TextNode.ACenter)
+        # Asset status indicator
+        status_txt = "[assets] models loaded — per-pixel lighting ON" if self._using_assets \
+                     else "[assets] no models — using procedural geometry"
+        self._hud_asset_status=OnscreenText(text=status_txt,pos=(0,0.84),scale=0.030,
+            fg=(0.5,0.7,0.4,0.8) if self._using_assets else (0.7,0.5,0.3,0.7),
+            shadow=(0,0,0,0.4),align=TextNode.ACenter,mayChange=False)
+        self._hud_all=[self._hud_time,self._hud_health_bar,self._hud_health_lbl,
+            self._hud_troopers,self._hud_weapon,self._hud_ammo,self._hud_ammo_res,
+            self._hud_reload_bar,self._hud_kills,self._hud_kills_lbl,self._hud_wave,
+            self._hud_hint,self._hud_asset_status,*self._ch]
+        self._set_hud_visible(False)
+        self._overlay_np=None
+
+    def _set_hud_visible(self,v):
+        for h in self._hud_all: h.show() if v else h.hide()
+
+    def _update_hud_weapon(self):
+        name="Springfield Carbine" if self._weapon==WeaponType.CARBINE else "Colt Revolver"
+        self._hud_weapon.setText(name); self._update_hud_ammo()
+
+    def _update_hud_ammo(self):
+        if self._weapon==WeaponType.CARBINE:
+            atxt="LOADED" if self._carb_loaded>0 else "— EMPTY —"
+            rtxt=f"Reserve: {self._carb_ammo} rds"
+            acol=(0.94,0.92,0.86,1) if self._carb_loaded>0 else (0.80,0.20,0.12,1)
+        else:
+            atxt="| "*self._colt_loaded+"  "*(COLT_CAP-self._colt_loaded)
+            rtxt=f"Reserve: {self._colt_ammo} rds"; acol=(0.72,0.58,0.20,1) if self._colt_loaded>1 else (0.80,0.20,0.12,1)
+        self._hud_ammo.setText(atxt); self._hud_ammo.setFg(acol); self._hud_ammo_res.setText(rtxt)
+
+    def _update_hud_dynamic(self):
+        mins=int(self._elapsed//60); secs=int(self._elapsed%60)
+        self._hud_time.setText(f"25 June 1876  —  Little Bighorn, Montana  —  {mins:02d}:{secs:02d}")
+        hp=max(0,self._hp); self._hud_health_bar["value"]=hp
+        self._hud_health_bar["barColor"]=(
+            (0.28,0.78,0.22,1) if hp>50 else (0.86,0.62,0.08,1) if hp>25 else (0.80,0.15,0.10,1))
+        self._hud_troopers.setText(f"7th Cavalry:  {sum(1 for t in self._troopers if t.alive)} troopers")
+        self._hud_kills.setText(str(self._kills)); self._hud_wave.setText(f"Wave {self._wave}")
+
+    # ── Overlays ───────────────────────────────────────────────────────────────
+
+    def _clear_overlay(self):
+        if self._overlay_np: self._overlay_np.removeNode(); self._overlay_np=None
+
+    def _show_title(self):
+        self._clear_overlay(); self._set_hud_visible(False)
+        f=DirectFrame(frameColor=(0.06,0.04,0.02,0.90),frameSize=(-1.4,1.4,-1.0,1.0))
+        self._overlay_np=f
+        asset_note = ("3D models loaded — per-pixel lighting active" if self._using_assets
+                      else f"No models found — drop .glb files into: models/")
+        rows=[
+            ("LITTLE BIGHORN",                        0.72,(0.72,0.16,0.09,1),0.20),
+            ("LAST STAND",                            0.45,(0.90,0.82,0.65,1),0.20),
+            ("25 June 1876 — Montana Territory",      0.14,(0.72,0.63,0.43,1),0.065),
+            ("Custer's 7th Cavalry are surrounded.",  0.00,(0.65,0.58,0.40,1),0.050),
+            ("Survive as long as you can.",          -0.08,(0.65,0.58,0.40,1),0.050),
+            ("There are no reinforcements.",         -0.16,(0.65,0.58,0.40,1),0.050),
+            ("WASD — Move   Mouse — Look   Click/Space — Fire",
+                                                     -0.34,(0.52,0.46,0.32,1),0.042),
+            ("R — Reload     Tab — Switch weapon",   -0.42,(0.52,0.46,0.32,1),0.042),
+            (asset_note,                             -0.58,
+             (0.40,0.65,0.35,0.9) if self._using_assets else (0.60,0.50,0.30,0.8), 0.035),
+            ("[SPACE]  to begin",                    -0.75,(0.72,0.58,0.20,1),0.072),
+        ]
+        for txt,y,col,sc in rows:
+            OnscreenText(text=txt,pos=(0,y),scale=sc,fg=col,
+                         shadow=(0,0,0,0.6),parent=f,align=TextNode.ACenter)
+        self.accept("space",self._begin_game)
+
+    def _begin_game(self):
+        self._clear_overlay(); self._start_game()
+        self._set_hud_visible(True); self._state="playing"
+        self.accept("space",self._on_fire_key); self.accept("space-up",self._clear_fire)
+
+    def _show_gameover(self):
+        self._set_hud_visible(False); self._clear_overlay()
+        mins=int(self._elapsed//60); secs=int(self._elapsed%60)
+        f=DirectFrame(frameColor=(0.04,0.02,0.01,0.92),frameSize=(-1.4,1.4,-1.0,1.0))
+        self._overlay_np=f
+        rows=[
+            ("THE 7TH CAVALRY FALLS",                  0.72,(0.72,0.16,0.09,1),0.18),
+            (f"Survived:  {mins} min {secs:02d} sec",  0.44,(0.90,0.82,0.65,1),0.090),
+            (f"Enemies fallen:  {self._kills}",         0.30,(0.90,0.82,0.65,1),0.090),
+            ('"We shall never meet again."',             0.06,(0.72,0.63,0.43,1),0.058),
+            ("— Attributed to Custer, final dispatch", -0.04,(0.55,0.46,0.30,1),0.040),
+            ("Lakota/Cheyenne carried Winchester 1873 repeating rifles,",
+                                                       -0.22,(0.65,0.58,0.40,1),0.038),
+            ("outgunning Custer's single-shot Springfield carbines.",
+                                                       -0.30,(0.65,0.58,0.40,1),0.038),
+            ("[SPACE] play again     [ESC] quit",       -0.70,(0.55,0.46,0.32,1),0.058),
+        ]
+        for txt,y,col,sc in rows:
+            OnscreenText(text=txt,pos=(0,y),scale=sc,fg=col,
+                         shadow=(0,0,0,0.6),parent=f,align=TextNode.ACenter)
+        self.accept("space",self._begin_game)
+
+
+if __name__ == "__main__":
+    LittleBighornGame().run()
