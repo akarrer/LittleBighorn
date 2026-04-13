@@ -2,39 +2,19 @@
 Little Bighorn — Last Stand  (25 June 1876)
 Engine: Panda3D      pip install panda3d
 
-─────────────────────────────────────────────────────────────
-  DROP MODELS HERE:   models/
-    trooper.glb       Union cavalry soldier
-    horse.glb         War pony
-    warrior.glb       Lakota/Cheyenne rider
-    dead.glb          Fallen figure (optional)
+DROP MODELS HERE: models/  (trooper.glb  horse.glb  warrior.glb  dead.glb)
+Sketchfab / poly.pizza / Mixamo — see MODEL_CFG to tune scale.
+Falls back to procedural geometry if files missing.
 
-  Where to get free models:
-    • Sketchfab.com  — filter: free + downloadable
-      search "US cavalry", "Native American warrior", "horse"
-    • Mixamo.com     — free rigged humans (needs Blender export)
-    • poly.pizza     — free low-poly models
+Controls: WASD Move · Mouse Look · Click/Space Fire
+          R Reload · Tab Switch weapon · ESC Quit
 
-  If a model file is missing the game falls back to the
-  procedural box-mesh version automatically.
-
-  Per-pixel lighting (render.setShaderAuto) is enabled
-  automatically when any .glb model is loaded.
-─────────────────────────────────────────────────────────────
-
-Controls:
-  W/S        — Move forward / backward
-  A/D        — Strafe left / right
-  Mouse      — Look (captured)
-  Left click — Fire
-  R          — Reload
-  Tab        — Switch weapon  (Carbine ↔ Colt)
-  ESC        — Quit
+Last-man-standing: each trooper has individual HP.
+When all troopers are dead AND you are dead, it's over.
 """
-
 from __future__ import annotations
-import math, random, sys, os
-from dataclasses import dataclass
+import math, random, sys
+from dataclasses import dataclass, field
 from typing import List, Optional
 from enum import Enum, auto
 from pathlib import Path
@@ -42,344 +22,565 @@ from pathlib import Path
 from direct.showbase.ShowBase import ShowBase
 from direct.gui.DirectGui import DirectFrame, OnscreenText, DirectWaitBar
 from direct.task import Task
+from direct.filter.CommonFilters import CommonFilters
 from panda3d.core import (
     Vec3, Vec4, LColor, Point3,
     GeomNode, Geom, GeomVertexFormat, GeomVertexData,
     GeomVertexWriter, GeomTriangles,
     NodePath, AmbientLight, DirectionalLight, Fog,
-    CardMaker, TextureStage,
-    Texture, PNMImage,
+    CardMaker, TextureStage, Texture, PNMImage,
     WindowProperties, TextNode,
+    GeoMipTerrain,
     loadPrcFileData,
 )
 
 loadPrcFileData("", """
     window-title Little Bighorn - Last Stand (25 June 1876)
-    win-size 1280 800
+    win-size 1920 1080
     sync-video 0
-    show-frame-rate-meter 0
+    show-frame-rate-meter 1
     cursor-hidden 1
     fullscreen 0
+    framebuffer-multisample 1
+    multisamples 4
 """)
 
-# ── Model folder — sits next to this script ────────────────────────────────────
-SCRIPT_DIR  = Path(__file__).parent
-MODELS_DIR  = SCRIPT_DIR / "models"
-
-# ── Model scale / position corrections ────────────────────────────────────────
-# Tune these per-model after downloading. Values depend on the source file.
-MODEL_CFG = {
-    # key: (scale, z_offset, h_offset)
-    # scale    — uniform scale so the character is ~1.8 units tall
-    # z_offset — raise/lower so feet touch z=0
-    # h_offset — rotate if model faces wrong direction (degrees)
-    "trooper": (1.0,  0.0,  0.0),
-    "horse":   (1.0,  0.0,  0.0),
-    "warrior": (1.0,  0.0,  0.0),
-    "dead":    (1.0,  0.0,  0.0),
+SCRIPT_DIR = Path(__file__).parent
+MODELS_DIR = SCRIPT_DIR / "models"
+MODEL_CFG  = {
+    "trooper": (1.0, 0.0,   0.0),
+    "horse":   (1.0, 0.0,   0.0),
+    "warrior": (1.0, 1.85,  0.0),
+    "dead":    (1.0, 0.0,   0.0),
 }
 
 # ── Constants ──────────────────────────────────────────────────────────────────
-PLAYER_SPEED   = 8.0
-MOUSE_SENS     = 0.12
-CAM_HEIGHT     = 1.7
+PLAYER_SPEED  = 8.0;  MOUSE_SENS = 0.12;  CAM_HEIGHT = 1.7
+CARBINE_DMG   = 90;   CARBINE_RELOAD = 2.8; CARBINE_RANGE = 80.0
+COLT_DMG      = 48;   COLT_RELOAD    = 3.2; COLT_RANGE    = 25.0; COLT_CAP = 6
+TROOPER_COUNT = 14;   TROOPER_RATE = 1.8;  TROOPER_R = 0.5; TROOPER_HP = 100
+ENEMY_HP      = 60;   ENEMY_DMG    = 8;    ENEMY_ATK_R = 1.8
+ENEMY_FIRE_R  = 22.0; ENEMY_RATE   = 0.55
+ENEMY_SPD_MIN = 7.0;  ENEMY_SPD_MAX = 11.0; ENEMY_R = 0.8
+SPAWN_MIN     = 35.0; SPAWN_MAX    = 60.0
+INIT_ENEMIES  = 25;   WAVE_TIME    = 12.0; WAVE_ADD = 10
+TERRAIN_SIZE  = 513;  TERRAIN_SCALE = 0.5
 
-CARBINE_DMG    = 90;  CARBINE_RELOAD = 2.8; CARBINE_RANGE = 80.0
-COLT_DMG       = 48;  COLT_RELOAD    = 3.2; COLT_RANGE    = 25.0; COLT_CAP = 6
+def vlen2(x,y): return math.hypot(x,y)
+def vnorm2(x,y):
+    l=vlen2(x,y); return (x/l,y/l) if l>1e-6 else (0.,0.)
 
-TROOPER_COUNT  = 14
-TROOPER_RATE   = 1.8
-TROOPER_R      = 0.5
-TROOPER_HP     = 100
-
-ENEMY_HP       = 60;  ENEMY_DMG = 8;   ENEMY_ATK_R  = 1.8
-ENEMY_FIRE_R   = 22.0; ENEMY_RATE = 0.55
-ENEMY_SPD_MIN  = 7.0;  ENEMY_SPD_MAX = 11.0
-ENEMY_R        = 0.8
-
-SPAWN_MIN      = 35.0; SPAWN_MAX  = 60.0
-INIT_ENEMIES   = 25;   WAVE_TIME  = 12.0; WAVE_ADD = 10
-
-GROUND_SIZE    = 220.0
-HILL_COUNT     = 22
-
-# ── Helpers ────────────────────────────────────────────────────────────────────
-def vlen2(x, y): return math.hypot(x, y)
-def vnorm2(x, y):
-    l = vlen2(x, y)
-    return (x/l, y/l) if l > 1e-6 else (0.0, 0.0)
-
-# ── Procedural geometry (fallback when no .glb files present) ─────────────────
-
-def _add_box(vw, nw, cw, cx, cy, cz, sx, sy, sz, r, g, b):
-    hw, hh, hd = sx/2, sy/2, sz/2
-    col = (r/255, g/255, b/255, 1)
-    faces = [
-        (( 0, 0, 1), [(-hw,-hd, hh),( hw,-hd, hh),( hw, hd, hh),(-hw, hd, hh)]),
-        (( 0, 0,-1), [( hw,-hd,-hh),(-hw,-hd,-hh),(-hw, hd,-hh),( hw, hd,-hh)]),
-        (( 1, 0, 0), [( hw,-hd,-hh),( hw, hd,-hh),( hw, hd, hh),( hw,-hd, hh)]),
-        ((-1, 0, 0), [(-hw, hd,-hh),(-hw,-hd,-hh),(-hw,-hd, hh),(-hw, hd, hh)]),
-        (( 0, 1, 0), [(-hw, hd,-hh),( hw, hd,-hh),( hw, hd, hh),(-hw, hd, hh)]),
-        (( 0,-1, 0), [( hw,-hd,-hh),(-hw,-hd,-hh),(-hw,-hd, hh),( hw,-hd, hh)]),
-    ]
-    base = vw.getWriteRow()
-    for (nx, ny, nz), corners in faces:
-        for (dx, dy, dz) in corners:
-            vw.addData3(cx+dx, cz+dy, cy+dz)
-            nw.addData3(nx, ny, nz)
-            cw.addData4(*col)
-    return base
-
-def _add_cyl(vw, nw, cw, cx, cy, cz, radius, height, r, g, b, steps=8):
-    col = (r/255, g/255, b/255, 1)
-    base = vw.getWriteRow()
-    for i in range(steps):
-        a0 = i/steps*math.pi*2; a1 = (i+1)/steps*math.pi*2
-        x0,y0 = math.cos(a0)*radius, math.sin(a0)*radius
-        x1,y1 = math.cos(a1)*radius, math.sin(a1)*radius
-        for (dx,dy,dz,nx,ny) in [
-            (x0,y0,0,x0,y0),(x1,y1,0,x1,y1),
-            (x1,y1,height,x1,y1),(x0,y0,height,x0,y0)]:
-            vw.addData3(cx+dx, cz+dy, cy+dz)
-            nw.addData3(nx, ny, 0)
-            cw.addData4(*col)
-    return base
-
-def _build_mesh(vdata, tris) -> NodePath:
-    geom = Geom(vdata); geom.addPrimitive(tris)
-    node = GeomNode("mesh"); node.addGeom(geom)
-    np = NodePath(node)
-    np.setColorOff(); np.setLightOff()
-    return np
+# ── Geometry helpers ───────────────────────────────────────────────────────────
 
 def _new_writers():
-    fmt   = GeomVertexFormat.getV3n3c4()
-    vdata = GeomVertexData("m", fmt, Geom.UHStatic)
-    tris  = GeomTriangles(Geom.UHStatic)
-    vw = GeomVertexWriter(vdata, "vertex")
-    nw = GeomVertexWriter(vdata, "normal")
-    cw = GeomVertexWriter(vdata, "color")
-    return vdata, tris, vw, nw, cw
+    fmt=GeomVertexFormat.getV3n3c4()
+    vdata=GeomVertexData("m",fmt,Geom.UHStatic)
+    tris=GeomTriangles(Geom.UHStatic)
+    vw=GeomVertexWriter(vdata,"vertex")
+    nw=GeomVertexWriter(vdata,"normal")
+    cw=GeomVertexWriter(vdata,"color")
+    return vdata,tris,vw,nw,cw
 
-def _box_tris(tris, base):
-    for f in range(6):
-        b0 = base + f*4
-        tris.addVertices(b0, b0+1, b0+2)
-        tris.addVertices(b0, b0+2, b0+3)
+def _build_mesh(vdata,tris,two_sided=False) -> NodePath:
+    geom=Geom(vdata); geom.addPrimitive(tris)
+    node=GeomNode("mesh"); node.addGeom(geom)
+    np=NodePath(node); np.setColorOff(); np.setLightOff()
+    if two_sided: np.setTwoSided(True)
+    return np
 
-def _cyl_tris(tris, base, steps=8):
+def _add_box(vw,nw,cw,cx,cy,cz,sx,sy,sz,r,g,b):
+    hw,hh,hd=sx/2,sy/2,sz/2; col=(r/255,g/255,b/255,1)
+    faces=[
+        ((0,0,1),[(-hw,-hd,hh),(hw,-hd,hh),(hw,hd,hh),(-hw,hd,hh)]),
+        ((0,0,-1),[(hw,-hd,-hh),(-hw,-hd,-hh),(-hw,hd,-hh),(hw,hd,-hh)]),
+        ((1,0,0),[(hw,-hd,-hh),(hw,hd,-hh),(hw,hd,hh),(hw,-hd,hh)]),
+        ((-1,0,0),[(-hw,hd,-hh),(-hw,-hd,-hh),(-hw,-hd,hh),(-hw,hd,hh)]),
+        ((0,1,0),[(-hw,hd,-hh),(hw,hd,-hh),(hw,hd,hh),(-hw,hd,hh)]),
+        ((0,-1,0),[(hw,-hd,-hh),(-hw,-hd,-hh),(-hw,-hd,hh),(hw,-hd,hh)]),
+    ]
+    base=vw.getWriteRow()
+    for (nx,ny,nz),corners in faces:
+        for (dx,dy,dz) in corners:
+            vw.addData3(cx+dx,cz+dy,cy+dz); nw.addData3(nx,ny,nz); cw.addData4(*col)
+    return base
+
+def _add_cyl(vw,nw,cw,cx,cy,cz,radius,height,r,g,b,steps=8):
+    col=(r/255,g/255,b/255,1); base=vw.getWriteRow()
     for i in range(steps):
-        b0 = base + i*4
-        tris.addVertices(b0, b0+1, b0+2)
-        tris.addVertices(b0, b0+2, b0+3)
+        a0=i/steps*math.pi*2; a1=(i+1)/steps*math.pi*2
+        x0,y0=math.cos(a0)*radius,math.sin(a0)*radius
+        x1,y1=math.cos(a1)*radius,math.sin(a1)*radius
+        for (dx,dy,dz,nx,ny) in [(x0,y0,0,x0,y0),(x1,y1,0,x1,y1),(x1,y1,height,x1,y1),(x0,y0,height,x0,y0)]:
+            vw.addData3(cx+dx,cz+dy,cy+dz); nw.addData3(nx,ny,0); cw.addData4(*col)
+    return base
 
-def make_trooper_model_proc() -> NodePath:
-    vdata, tris, vw, nw, cw = _new_writers()
-    def B(cx,cy,cz,sx,sy,sz,r,g,b): _box_tris(tris, _add_box(vw,nw,cw,cx,cy,cz,sx,sy,sz,r,g,b))
-    def C(cx,cy,cz,rd,h,r,g,b):     _cyl_tris(tris, _add_cyl(vw,nw,cw,cx,cy,cz,rd,h,r,g,b))
-    B(-0.13,0.00,0.0, 0.18,0.28,0.22, 28,18,10); B( 0.13,0.00,0.0, 0.18,0.28,0.22, 28,18,10)
-    B(-0.13,0.28,0.0, 0.20,0.54,0.21, 52,65,88); B( 0.13,0.28,0.0, 0.20,0.54,0.21, 52,65,88)
-    B(-0.22,0.40,0.0, 0.04,0.38,0.04, 180,148,40); B( 0.22,0.40,0.0, 0.04,0.38,0.04, 180,148,40)
-    B( 0.0, 0.82,0.0, 0.48,0.52,0.26, 44,62,82)
-    B( 0.0, 0.80,0.0, 0.50,0.06,0.28, 140,110,35)
-    B(-0.32,0.90,0.0, 0.16,0.46,0.18, 44,62,82); B( 0.32,0.90,0.0, 0.16,0.46,0.18, 44,62,82)
-    C(-0.32,0.84,0.0, 0.09,0.12, 200,165,120); C( 0.32,0.84,0.0, 0.09,0.12, 200,165,120)
-    B( 0.0, 1.06,0.0, 0.16,0.40,0.16, 200,165,120)
-    B( 0.0, 1.46,0.0, 0.28,0.32,0.26, 200,165,120)
-    B( 0.0, 1.78,0.0, 0.42,0.06,0.40, 22,14,8); B( 0.0, 1.84,0.0, 0.26,0.24,0.28, 22,14,8)
-    B( 0.0, 1.78,0.0, 0.28,0.05,0.30, 140,110,35)
-    B( 0.42,0.72,0.0, 0.05,1.05,0.05, 55,42,20)
-    root = _build_mesh(vdata, tris); root.setTwoSided(False)
+def _box_tris(tris,base):
+    for f in range(6):
+        b0=base+f*4; tris.addVertices(b0,b0+1,b0+2); tris.addVertices(b0,b0+2,b0+3)
+
+def _cyl_tris(tris,base,steps=8):
+    for i in range(steps):
+        b0=base+i*4; tris.addVertices(b0,b0+1,b0+2); tris.addVertices(b0,b0+2,b0+3)
+
+
+# ── Articulated horse model — scene graph with named leg nodes ─────────────────
+
+def make_horse_articulated(parent: NodePath) -> NodePath:
+    """Horse with individually animatable leg NodePaths.
+    Returns root; legs accessible as root.find('**/leg_*')."""
+    root = parent.attachNewNode("horse_root")
+    HC=(112,72,32); HD=(98,60,25); HM=(30,18,8)
+
+    def solid(name, cx, cy, cz, sx, sy, sz, r, g, b) -> NodePath:
+        vdata,tris,vw,nw,cw=_new_writers()
+        _box_tris(tris,_add_box(vw,nw,cw,cx,cy,cz,sx,sy,sz,r,g,b))
+        np=_build_mesh(vdata,tris); np.reparentTo(root); return np
+
+    # Body
+    solid("body",     0.,1.36, 0.,  0.60,0.72,1.50, *HC)
+    solid("rump",     0.,1.42,-0.62,0.54,0.58,0.36, *HC)
+    solid("chest",    0.,1.38, 0.68,0.52,0.56,0.38, *HC)
+    solid("saddle",   0.,1.74, 0.,  0.62,0.08,0.80, 165,42,22)
+    solid("neck",     0.,1.72, 0.62,0.30,0.44,0.30, *HC)
+    solid("head",     0.,1.88, 0.96,0.24,0.28,0.52, *HC)
+    solid("muzzle",   0.,1.72, 1.14,0.18,0.18,0.28, HD[0]-5,HD[1]-5,HD[2]-3)
+    solid("ear_l",   -0.10,2.06,0.84,0.08,0.16,0.08, *HM)
+    solid("ear_r",    0.10,2.06,0.84,0.08,0.16,0.08, *HM)
+    solid("eye_l",   -0.13,1.91,1.06,0.04,0.06,0.06, 18,10,4)
+    solid("eye_r",    0.13,1.91,1.06,0.04,0.06,0.06, 18,10,4)
+    solid("mane",     0.,1.92, 0.72,0.10,0.34,0.46, *HM)
+    solid("tail",     0.,1.44,-0.88,0.12,0.52,0.14, *HM)
+
+    # Legs — each as a pivot NodePath so we can rotate them
+    leg_defs = [
+        ("leg_fl", -0.20,  0.32),
+        ("leg_fr",  0.20,  0.32),
+        ("leg_bl", -0.20, -0.38),
+        ("leg_br",  0.20, -0.38),
+    ]
+    for name, lx, lz in leg_defs:
+        pivot = root.attachNewNode(name)
+        pivot.setPos(lx, lz, 1.10)   # pivot at hip/shoulder height
+        vdata,tris,vw,nw,cw=_new_writers()
+        # Upper leg
+        _box_tris(tris,_add_box(vw,nw,cw,0.,-0.55,0.,0.20,1.10,0.20,*HD))
+        # Hoof
+        _box_tris(tris,_add_box(vw,nw,cw,0.,-1.10,0.,0.20,0.16,0.22,*HM))
+        leg_mesh=_build_mesh(vdata,tris); leg_mesh.reparentTo(pivot)
+
     return root
 
-def make_horse_model_proc() -> NodePath:
-    vdata, tris, vw, nw, cw = _new_writers()
-    def B(cx,cy,cz,sx,sy,sz,r,g,b): _box_tris(tris, _add_box(vw,nw,cw,cx,cy,cz,sx,sy,sz,r,g,b))
-    HC=(110,70,30); HM=(35,20,10)
-    B( 0.0,1.15, 0.0, 0.55,0.70,1.40,*HC); B( 0.0,1.25,-0.55,0.50,0.55,0.50,*HC)
-    B( 0.0,1.10, 0.60,0.48,0.55,0.30,*HC); B( 0.0,1.55, 0.52,0.28,0.60,0.28,*HC)
-    B( 0.0,1.60, 0.88,0.22,0.26,0.50,*HC); B( 0.0,1.48, 1.04,0.16,0.16,0.24, HC[0]-10,HC[1]-5,HC[2]-5)
-    B(-0.09,1.82,0.82,0.06,0.14,0.06,*HM); B( 0.09,1.82,0.82,0.06,0.14,0.06,*HM)
-    B( 0.0,1.72, 0.60,0.08,0.28,0.38,*HM)
-    B(-0.18,0.56, 0.32,0.16,1.12,0.18,HC[0]-8,HC[1]-4,HC[2]-4)
-    B( 0.18,0.56, 0.32,0.16,1.12,0.18,HC[0]-8,HC[1]-4,HC[2]-4)
-    B(-0.18,0.56,-0.40,0.16,1.12,0.18,HC[0]-8,HC[1]-4,HC[2]-4)
-    B( 0.18,0.56,-0.40,0.16,1.12,0.18,HC[0]-8,HC[1]-4,HC[2]-4)
-    B(-0.18,0.08, 0.32,0.17,0.16,0.19,*HM); B( 0.18,0.08, 0.32,0.17,0.16,0.19,*HM)
-    B(-0.18,0.08,-0.40,0.17,0.16,0.19,*HM); B( 0.18,0.08,-0.40,0.17,0.16,0.19,*HM)
-    B( 0.0,1.20,-0.82,0.10,0.60,0.12,*HM)
-    B( 0.0,1.85, 0.0, 0.56,0.08,0.70, 160,40,20)
-    root = _build_mesh(vdata, tris); root.setTwoSided(False)
+
+# ── Articulated trooper — named arm node for aim animation ────────────────────
+
+def make_trooper_articulated(parent: NodePath) -> NodePath:
+    """Union 7th Cavalry trooper. Height ~2.0u. Feet at Z=0.
+    Iteration 3: slimmer boots, visible leg gap, coat detail, face features,
+    rifle rests on shoulder at parade rest by default."""
+    root = parent.attachNewNode("trooper_root")
+
+    def B(cx,cy,cz,sx,sy,sz,r,g,b):
+        vdata,tris,vw,nw,cw=_new_writers()
+        _box_tris(tris,_add_box(vw,nw,cw,cx,cy,cz,sx,sy,sz,r,g,b))
+        _build_mesh(vdata,tris).reparentTo(root)
+
+    # ── Boots  0.00-0.22  (slimmer, less dominant) ────────────
+    B(-0.09, 0.11, 0.01,  0.15, 0.22, 0.18,  32,20,10)
+    B( 0.09, 0.11, 0.01,  0.15, 0.22, 0.18,  32,20,10)
+
+    # ── Trousers  0.20-0.90  (clear gap between legs) ─────────
+    B(-0.09, 0.55, 0.00,  0.15, 0.70, 0.16,  52,65,90)
+    B( 0.09, 0.55, 0.00,  0.15, 0.70, 0.16,  52,65,90)
+    # Yellow seam stripe
+    B(-0.17, 0.55, 0.00,  0.02, 0.68, 0.02, 192,158,44)
+    B( 0.17, 0.55, 0.00,  0.02, 0.68, 0.02, 192,158,44)
+
+    # ── Coat/Torso  0.88-1.44 ─────────────────────────────────
+    # Hip section
+    B( 0.00, 0.98, 0.00,  0.36, 0.20, 0.22,  42,60,82)
+    # Mid chest
+    B( 0.00, 1.16, 0.00,  0.38, 0.24, 0.22,  44,62,84)
+    # Shoulder/upper chest — widest point
+    B( 0.00, 1.33, 0.00,  0.42, 0.22, 0.22,  46,64,86)
+    # Dark blue collar
+    B( 0.00, 1.43, 0.00,  0.28, 0.06, 0.20,  28,38,58)
+    # Belt
+    B( 0.00, 0.90, 0.00,  0.38, 0.05, 0.24, 148,118,40)
+    # Cartridge box
+    B( 0.16, 0.92, 0.12,  0.09, 0.08, 0.06,  22,14, 8)
+    # Three brass buttons
+    for by in [1.02, 1.14, 1.26]:
+        B(0.00, by, 0.12,  0.04, 0.04, 0.03, 190,158,46)
+    # Dark lapel V-shape on chest
+    B(-0.06, 1.22, 0.12,  0.06, 0.22, 0.02,  30,42,62)
+    B( 0.06, 1.22, 0.12,  0.06, 0.22, 0.02,  30,42,62)
+
+    # ── Left arm  0.94-1.38 (resting at side) ─────────────────
+    B(-0.26, 1.15, 0.00,  0.13, 0.44, 0.14,  44,62,84)
+    B(-0.26, 0.93, 0.00,  0.12, 0.14, 0.13, 205,168,122)
+
+    # ── Neck  1.42-1.52 ───────────────────────────────────────
+    B( 0.00, 1.47, 0.00,  0.13, 0.10, 0.12, 200,162,118)
+
+    # ── Head  1.50-1.78 ───────────────────────────────────────
+    B( 0.00, 1.64, 0.00,  0.26, 0.28, 0.22, 205,168,122)
+    # Eyes — dark dots on front face
+    B(-0.07, 1.68, 0.12,  0.05, 0.04, 0.02,  45,30,20)
+    B( 0.07, 1.68, 0.12,  0.05, 0.04, 0.02,  45,30,20)
+    # Nose
+    B( 0.00, 1.62, 0.12,  0.04, 0.04, 0.02, 185,145,100)
+    # Mouth / chin shadow
+    B( 0.00, 1.55, 0.11,  0.08, 0.03, 0.02, 170,125,90)
+    # Moustache (Custer-style)
+    B( 0.00, 1.59, 0.12,  0.10, 0.03, 0.02,  80,50,30)
+
+    # ── Campaign hat  1.76-1.96 ────────────────────────────────
+    B( 0.00, 1.78, 0.00,  0.36, 0.04, 0.34,  18,12, 6)  # brim
+    B( 0.00, 1.87, 0.00,  0.22, 0.18, 0.22,  18,12, 6)  # crown
+    B( 0.00, 1.78, 0.00,  0.24, 0.04, 0.24, 152,120,42)  # gold band
+
+    # ── Right arm — pivot at shoulder, rifle at parade rest ────
+    # Shoulder is at Z=1.38 in root space
+    arm_pivot = root.attachNewNode("right_arm")
+    arm_pivot.setPos(0.25, 0.00, 1.38)
+
+    vdata,tris,vw,nw,cw=_new_writers()
+    # Upper arm (hangs down from shoulder pivot)
+    _box_tris(tris,_add_box(vw,nw,cw,
+        0.00, -0.22, 0.00,   0.13, 0.44, 0.14,  44,62,84))
+    # Forearm + hand
+    _box_tris(tris,_add_box(vw,nw,cw,
+        0.00, -0.44, 0.00,   0.12, 0.14, 0.12,  205,168,122))
+    # Springfield carbine — stock at hand, barrel upward along arm axis
+    # Stock (at hand level)
+    _box_tris(tris,_add_box(vw,nw,cw,
+        0.01, -0.38, 0.06,   0.06, 0.28, 0.06,  65,48,22))
+    # Receiver
+    _box_tris(tris,_add_box(vw,nw,cw,
+        0.01, -0.12, 0.07,   0.06, 0.16, 0.08,  50,46,40))
+    # Barrel — extends upward past shoulder
+    _box_tris(tris,_add_box(vw,nw,cw,
+        0.01,  0.20, 0.07,   0.04, 0.80, 0.04,  38,34,30))
+    arm_mesh=_build_mesh(vdata,tris); arm_mesh.reparentTo(arm_pivot)
+
     return root
+
+
+# ── Warrior rider model ────────────────────────────────────────────────────────
 
 def make_warrior_model_proc() -> NodePath:
-    vdata, tris, vw, nw, cw = _new_writers()
-    def B(cx,cy,cz,sx,sy,sz,r,g,b): _box_tris(tris, _add_box(vw,nw,cw,cx,cy,cz,sx,sy,sz,r,g,b))
-    def C(cx,cy,cz,rd,h,r,g,b):     _cyl_tris(tris, _add_cyl(vw,nw,cw,cx,cy,cz,rd,h,r,g,b))
-    SK=(155,96,48); TN=(130,80,40)
-    B( 0.0,0.10,0.0,0.38,0.24,0.28,TN[0]-10,TN[1]-5,TN[2]-5)
-    B( 0.0,0.46,0.0,0.44,0.48,0.24,*TN)
-    B(-0.28,0.52,0.08,0.14,0.42,0.16,*TN); B( 0.28,0.62,0.0,0.14,0.56,0.16,*TN)
-    C(-0.28,0.48,0.08,0.08,0.10,*SK); C( 0.28,0.78,0.0,0.08,0.10,*SK)
-    B( 0.0,0.94,0.0,0.14,0.28,0.14,*SK)
-    B( 0.0,1.22,0.0,0.26,0.30,0.24,*SK)
-    B( 0.0,1.50,0.0,0.28,0.08,0.26,25,15,8)
-    B(-0.14,1.16,0.0,0.06,0.44,0.06,25,15,8); B( 0.14,1.16,0.0,0.06,0.44,0.06,25,15,8)
-    B( 0.10,1.58,0.0,0.04,0.28,0.04,180,40,20); B( 0.10,1.86,0.0,0.04,0.12,0.04,220,200,180)
-    B( 0.36,0.72,0.04,0.06,0.52,0.06,68,48,22)
-    B( 0.36,0.98,0.04,0.06,0.18,0.08,52,48,44)
-    B( 0.36,1.22,0.04,0.04,0.60,0.04,38,35,32)
-    root = _build_mesh(vdata, tris); root.setTwoSided(False)
-    return root
+    vdata,tris,vw,nw,cw=_new_writers()
+    def B(cx,cy,cz,sx,sy,sz,r,g,b): _box_tris(tris,_add_box(vw,nw,cw,cx,cy,cz,sx,sy,sz,r,g,b))
+    SK=(158,98,50); TN=(132,82,40); TND=(108,66,30)
+    B(0.,0.14,0., 0.42,0.28,0.30, *TND)
+    B(0.,0.52,0., 0.46,0.52,0.26, *TN)
+    B(0.,0.27,0., 0.48,0.06,0.10, *TND)
+    B(-0.31,0.57,0., 0.16,0.44,0.18, *TN)
+    B( 0.31,0.64,0., 0.16,0.52,0.18, *TN)
+    B(-0.31,0.34,0., 0.15,0.14,0.15, *SK)
+    B( 0.31,0.38,0., 0.15,0.14,0.15, *SK)
+    B(0.,0.86,0., 0.18,0.20,0.18, *SK)
+    B(0.,1.10,0., 0.28,0.32,0.26, *SK)
+    B(-0.07,1.10,0.14, 0.07,0.07,0.03, 185,32,18)
+    B( 0.07,1.10,0.14, 0.07,0.07,0.03, 185,32,18)
+    B(0.,1.26,0., 0.30,0.08,0.28, 22,13,5)
+    B(-0.16,0.88,0., 0.07,0.46,0.07, 22,13,5)
+    B( 0.16,0.88,0., 0.07,0.46,0.07, 22,13,5)
+    B(0.10,1.44,0., 0.05,0.30,0.05, 185,42,20)
+    B(0.10,1.74,0., 0.05,0.14,0.05, 225,205,185)
+    B(0.32,0.52,0.06, 0.07,0.44,0.07, 70,50,22)
+    B(0.32,0.74,0.07, 0.07,0.16,0.09, 54,50,46)
+    B(0.32,1.04,0.07, 0.05,0.62,0.05, 40,36,34)
+    B(0.36,0.66,0.07, 0.03,0.10,0.12, 50,46,42)
+    root=_build_mesh(vdata,tris); root.setTwoSided(False); return root
+
 
 def make_dead_model_proc() -> NodePath:
-    vdata, tris, vw, nw, cw = _new_writers()
-    _box_tris(tris, _add_box(vw,nw,cw,0,0.06,0,1.2,0.14,0.5,60,38,18))
-    return _build_mesh(vdata, tris)
+    vdata,tris,vw,nw,cw=_new_writers()
+    _box_tris(tris,_add_box(vw,nw,cw,0.,0.08,0.,1.4,0.16,0.5,55,35,16))
+    return _build_mesh(vdata,tris)
+
+
+# ── Viewmodel gun (attached to camera) ────────────────────────────────────────
+
+def make_viewmodel_carbine() -> NodePath:
+    """Springfield carbine visible in bottom-right of screen."""
+    vdata,tris,vw,nw,cw=_new_writers()
+    def B(cx,cy,cz,sx,sy,sz,r,g,b): _box_tris(tris,_add_box(vw,nw,cw,cx,cy,cz,sx,sy,sz,r,g,b))
+    # Stock — walnut brown, angled back toward player
+    B( 0.08, -0.12, 0.,  0.08, 0.14, 0.06,  72,52,24)
+    # Receiver block
+    B( 0.05,  0.06, 0.,  0.07, 0.18, 0.09,  55,50,44)
+    # Barrel — long, thin, forward
+    B( 0.03,  0.42, 0.,  0.04, 0.68, 0.04,  38,35,32)
+    # Barrel band
+    B( 0.03,  0.20, 0.,  0.05, 0.04, 0.06,  50,46,40)
+    # Lever guard
+    B( 0.10,  0.00, 0.,  0.03, 0.12, 0.12,  52,48,42)
+    # Grip / hand
+    B( 0.10, -0.10, 0.,  0.09, 0.10, 0.09, 200,165,120)
+    root=_build_mesh(vdata,tris); root.setTwoSided(False)
+    root.setLightOff()  # viewmodel unaffected by world lighting
+    return root
+
+def make_viewmodel_colt() -> NodePath:
+    """Colt SAA revolver viewmodel."""
+    vdata,tris,vw,nw,cw=_new_writers()
+    def B(cx,cy,cz,sx,sy,sz,r,g,b): _box_tris(tris,_add_box(vw,nw,cw,cx,cy,cz,sx,sy,sz,r,g,b))
+    B( 0.08, -0.10, 0.,  0.07,0.12,0.07, 68,48,22)   # grip
+    B( 0.05,  0.04, 0.,  0.08,0.14,0.10, 54,50,44)   # frame
+    B( 0.03,  0.04, 0.,  0.07,0.10,0.10, 58,54,48)   # cylinder
+    B( 0.03,  0.20, 0.,  0.04,0.28,0.05, 40,37,34)   # barrel
+    B( 0.10, -0.02, 0.,  0.03,0.08,0.10, 50,46,42)   # trigger guard
+    B( 0.10, -0.08, 0.,  0.09,0.09,0.09,200,165,120) # hand
+    root=_build_mesh(vdata,tris); root.setTwoSided(False)
+    root.setLightOff()
+    return root
 
 
 # ── Terrain ────────────────────────────────────────────────────────────────────
 
-def make_grass_texture(w=256, h=256) -> Texture:
-    img = PNMImage(w, h)
-    rng = random.Random(7)
-    for y in range(h):
-        for x in range(w):
-            r = 0.38 + rng.uniform(-0.05, 0.07)
-            g = 0.33 + rng.uniform(-0.04, 0.05)
-            b = 0.14 + rng.uniform(-0.02, 0.03)
-            img.setXel(x, y, r, g, b)
-    for _ in range(1200):
-        tx=rng.randint(0,w-1); ty=rng.randint(0,h-1)
-        img.setXel(tx,ty,img.getRed(tx,ty)*0.65,img.getGreen(tx,ty)*0.65,img.getBlue(tx,ty)*0.65)
-    tex = Texture("grass"); tex.load(img)
-    tex.setWrapU(Texture.WMRepeat); tex.setWrapV(Texture.WMRepeat)
-    tex.setMinfilter(Texture.FTLinearMipmapLinear)
-    return tex
+def _smooth_noise(x, y, freq, seed=0):
+    def s(t): return t*t*(3-2*t)
+    def h(xi,yi): return ((xi*1619+yi*31337+seed*6791)&0xFFFF)/65535.0
+    fx=x*freq; fy=y*freq
+    ix=int(fx); iy=int(fy); tx=s(fx-ix); ty=s(fy-iy)
+    return (h(ix,iy)*(1-tx)+h(ix+1,iy)*tx)*(1-ty)+(h(ix,iy+1)*(1-tx)+h(ix+1,iy+1)*tx)*ty
 
-def make_hill_texture(w=128, h=128) -> Texture:
-    img = PNMImage(w, h)
-    rng = random.Random(13)
-    for y in range(h):
-        for x in range(w):
-            img.setXel(x, y,
-                0.32+rng.uniform(-0.04,0.04),
-                0.27+rng.uniform(-0.03,0.03),
-                0.12+rng.uniform(-0.02,0.02))
-    tex = Texture("hill"); tex.load(img)
-    tex.setWrapU(Texture.WMRepeat); tex.setWrapV(Texture.WMRepeat)
-    return tex
+def make_heightmap(size=513) -> PNMImage:
+    img=PNMImage(size,size,3)
+    def ss(t): return t*t*(3-2*t)
+    for py in range(size):
+        for px in range(size):
+            nx=px/(size-1); ny=py/(size-1)
+            h  =_smooth_noise(nx,ny, 3,17)*0.50
+            h +=_smooth_noise(nx,ny, 7,53)*0.25
+            h +=_smooth_noise(nx,ny,14,99)*0.15
+            h +=_smooth_noise(nx,ny,28,137)*0.10
+            h=(h-0.5)*1.4+0.5
+            cx=nx-0.5; cy=ny-0.5; r2=cx*cx+cy*cy
+            flat=1.0-ss(max(0.,min(1.,(r2-0.04)/0.12)))
+            h=h*(1.-flat)+0.5*flat
+            v=min(1.,max(0.,h)); img.setXel(px,py,v,v,v)
+    return img
 
-def make_ground_node(size, tex) -> NodePath:
-    cm = CardMaker("ground")
-    cm.setFrame(-size/2, size/2, -size/2, size/2)
-    np = NodePath(cm.generate())
-    np.setP(-90); np.setTexture(tex)
-    np.setTexScale(TextureStage.getDefault(), size/10, size/10)
-    np.setColor(0.38, 0.33, 0.18, 1)
+
+def build_terrain_vis(hmap, sz, mid, world_size) -> NodePath:
+    """Custom vertex-coloured terrain mesh with slope-based colour and detail."""
+    hsize=hmap.getXSize(); GRID=160; rng=random.Random(31)
+    fmt=GeomVertexFormat.getV3n3c4()
+    vdata=GeomVertexData("tv",fmt,Geom.UHStatic)
+    vdata.setNumRows((GRID+1)*(GRID+1))
+    vw=GeomVertexWriter(vdata,"vertex")
+    nw=GeomVertexWriter(vdata,"normal")
+    cw=GeomVertexWriter(vdata,"color")
+
+    heights={}
+    for row in range(GRID+1):
+        for col in range(GRID+1):
+            hx=int(col/GRID*(hsize-1)); hy=int(row/GRID*(hsize-1))
+            hx=max(0,min(hsize-1,hx)); hy=max(0,min(hsize-1,hy))
+            heights[(row,col)]=hmap.getRed(hx,hy)*sz-mid
+
+    def get_h(r,c): return heights[(max(0,min(GRID,r)),max(0,min(GRID,c)))]
+
+    for row in range(GRID+1):
+        for col in range(GRID+1):
+            nx=col/GRID; ny=row/GRID
+            wx=nx*world_size-world_size/2; wy=ny*world_size-world_size/2
+            wz=heights[(row,col)]
+            step=world_size/GRID
+            dzdx=(get_h(row,col+1)-get_h(row,col-1))/(2*step)
+            dzdy=(get_h(row+1,col)-get_h(row-1,col))/(2*step)
+            slope=math.sqrt(dzdx*dzdx+dzdy*dzdy)
+            nl=math.sqrt(dzdx*dzdx+dzdy*dzdy+1.)
+            vw.addData3(wx,wy,wz); nw.addData3(-dzdx/nl,-dzdy/nl,1./nl)
+            h_norm=(wz+mid)/sz
+            # Base prairie colour
+            r=0.50+rng.gauss(0,.022); g=0.42+rng.gauss(0,.018); b=0.17+rng.gauss(0,.010)
+            # High ground: slightly more olive
+            if h_norm>0.62:
+                t=(h_norm-0.62)/0.38
+                r-=t*0.06; g+=t*0.03; b+=t*0.02
+            # Steep slopes: exposed rock, greyer
+            if slope>0.35:
+                t=min(1.,(slope-0.35)/0.4)
+                r=r*(1-t)+0.42*t; g=g*(1-t)+0.38*t; b=b*(1-t)+0.28*t
+            # Low flat: dusty beige
+            if h_norm<0.38:
+                t=(0.38-h_norm)/0.38
+                r+=t*0.07; g+=t*0.03; b-=t*0.02
+            # Occasional dirt patch
+            if rng.random()<0.07:
+                r=r*0.84+0.09; g=g*0.82+0.05; b=b*0.80+0.01
+            # Low-freq large-patch variation via noise
+            lf=_smooth_noise(nx,ny,4,42)*0.10-0.05
+            r+=lf; g+=lf*0.8; b+=lf*0.4
+            cw.addData4(max(0,min(1,r)),max(0,min(1,g)),max(0,min(1,b)),1.)
+
+    tris=GeomTriangles(Geom.UHStatic); stride=GRID+1
+    for row in range(GRID):
+        for col in range(GRID):
+            i=row*stride+col
+            tris.addVertices(i,i+1,i+stride); tris.addVertices(i+1,i+stride+1,i+stride)
+    geom=Geom(vdata); geom.addPrimitive(tris)
+    node=GeomNode("tv"); node.addGeom(geom)
+    np=NodePath(node); np.setColorOff()
     return np
 
-def make_hill_geom(cx, cz, rx, rz, h, tex, seed) -> NodePath:
-    rng = random.Random(seed); steps=28
-    fmt = GeomVertexFormat.getV3n3t2()
-    vdata = GeomVertexData("hill",fmt,Geom.UHStatic); vdata.setNumRows(steps+2)
+
+# ── World detail ───────────────────────────────────────────────────────────────
+
+def make_sky_dome(parent) -> NodePath:
+    fmt=GeomVertexFormat.getV3n3c4()
+    vdata=GeomVertexData("sky",fmt,Geom.UHStatic)
     vw=GeomVertexWriter(vdata,"vertex"); nw=GeomVertexWriter(vdata,"normal")
-    tw=GeomVertexWriter(vdata,"texcoord")
-    vw.addData3(cx+rng.uniform(-rx*.08,rx*.08),h,cz+rng.uniform(-rz*.08,rz*.08))
-    nw.addData3(0,1,0); tw.addData2(0.5,0.5)
+    cw=GeomVertexWriter(vdata,"color"); tris=GeomTriangles(Geom.UHStatic)
+    stacks=10; slices=24; R=450.
+    for st in range(stacks):
+        p0=st/stacks*math.pi*.5; p1=(st+1)/stacks*math.pi*.5
+        t0=st/stacks; t1=(st+1)/stacks
+        def sc(t):
+            return (max(0,min(1,0.70-t*0.28)), max(0,min(1,0.66-t*0.20)),
+                    max(0,min(1,0.50+t*0.20)), 1.)
+        for sl in range(slices):
+            a0=sl/slices*math.pi*2; a1=(sl+1)/slices*math.pi*2
+            q=[(math.cos(a0)*math.cos(p0)*R,math.sin(a0)*math.cos(p0)*R,math.sin(p0)*R,t0),
+               (math.cos(a1)*math.cos(p0)*R,math.sin(a1)*math.cos(p0)*R,math.sin(p0)*R,t0),
+               (math.cos(a1)*math.cos(p1)*R,math.sin(a1)*math.cos(p1)*R,math.sin(p1)*R,t1),
+               (math.cos(a0)*math.cos(p1)*R,math.sin(a0)*math.cos(p1)*R,math.sin(p1)*R,t1)]
+            base=vw.getWriteRow()
+            for (x,y,z,t) in q:
+                vw.addData3(x,y,z); nw.addData3(-x/R,-y/R,-z/R); cw.addData4(*sc(t))
+            tris.addVertices(base,base+1,base+2); tris.addVertices(base,base+2,base+3)
+    geom=Geom(vdata); geom.addPrimitive(tris)
+    node=GeomNode("sky"); node.addGeom(geom)
+    np=NodePath(node); np.reparentTo(parent); np.setTwoSided(True)
+    np.setBin("background",0); np.setDepthWrite(False)
+    np.setLightOff(); np.setFogOff(); np.setColorOff()
+    return np
+
+def make_sun_disc(parent) -> NodePath:
+    vdata,tris,vw,nw,cw=_new_writers(); base=vw.getWriteRow(); R=18.
+    cx,cy,cz=-280.,180.,320.; steps=20
+    vw.addData3(cx,cy,cz); nw.addData3(0,0,1); cw.addData4(1.,0.97,0.80,1)
     for i in range(steps+1):
         a=i/steps*math.pi*2
-        bx=cx+math.cos(a)*rx*rng.uniform(0.82,1.0); bz=cz+math.sin(a)*rz*rng.uniform(0.82,1.0)
-        vw.addData3(bx,0.0,bz); nw.addData3(0,1,0)
-        tw.addData2(0.5+math.cos(a)*0.5,0.5+math.sin(a)*0.5)
-    tris=GeomTriangles(Geom.UHStatic)
-    for i in range(1,steps+1): tris.addVertices(0,i,i+1)
-    geom=Geom(vdata); geom.addPrimitive(tris)
-    node=GeomNode("hill"); node.addGeom(geom)
-    np=NodePath(node); np.setTexture(tex); np.setColor(0.30,0.25,0.11,1)
+        vw.addData3(cx+math.cos(a)*R,cy+math.sin(a)*R,cz)
+        nw.addData3(0,0,1); cw.addData4(1.,0.92,0.60,.8)
+        if i>0: tris.addVertices(base,base+i,base+i+1)
+    np=_build_mesh(vdata,tris); np.reparentTo(parent)
+    np.setLightOff(); np.setFogOff(); np.setBin("background",1); np.setDepthWrite(False)
     return np
 
-def make_grass_tufts(size, count=600) -> NodePath:
-    vdata, tris, vw, nw, cw = _new_writers()
-    rng=random.Random(55)
+def make_grass_tufts(count=2000) -> NodePath:
+    vdata,tris,vw,nw,cw=_new_writers(); rng=random.Random(55)
+    hs=TERRAIN_SIZE*TERRAIN_SCALE/2
     for _ in range(count):
-        x=rng.uniform(-size/2,size/2); z=rng.uniform(-size/2,size/2)
-        h2=rng.uniform(0.12,0.35); w2=rng.uniform(0.04,0.10)
-        r=rng.uniform(0.28,0.42); g=rng.uniform(0.24,0.36); b=rng.uniform(0.08,0.16)
-        for ang in [0, math.pi/2]:
+        x=rng.uniform(-hs,hs); z=rng.uniform(-hs,hs)
+        h2=rng.uniform(.14,.42); w2=rng.uniform(.04,.12)
+        r=rng.uniform(.30,.46); g=rng.uniform(.25,.38); b=rng.uniform(.08,.18)
+        for ang in [0,math.pi/2]:
             dx=math.cos(ang)*w2; dz=math.sin(ang)*w2
             base=vw.getWriteRow()
             for (vx,vy,vz) in [(x-dx,z-dz,0),(x+dx,z+dz,0),(x+dx,z+dz,h2),(x-dx,z-dz,h2)]:
                 vw.addData3(vx,vy,vz); nw.addData3(0,0,1); cw.addData4(r,g,b,1)
             tris.addVertices(base,base+1,base+2); tris.addVertices(base,base+2,base+3)
-    np=_build_mesh(vdata,tris); np.setTwoSided(True)
-    return np
+    np=_build_mesh(vdata,tris,two_sided=True); return np
 
-def make_river_segment() -> NodePath:
-    vdata, tris, vw, nw, cw = _new_writers()
-    base=vw.getWriteRow()
-    for (vx,vy,vz) in [(-80,-30,0.02),(80,-28,0.02),(80,-22,0.02),(-80,-24,0.02)]:
-        vw.addData3(vx,vy,vz); nw.addData3(0,0,1); cw.addData4(0.30,0.38,0.48,1)
-    tris.addVertices(base,base+1,base+2); tris.addVertices(base,base+2,base+3)
-    np=_build_mesh(vdata,tris); np.setTwoSided(True)
-    return np
+def make_rocks(count=120) -> NodePath:
+    vdata,tris,vw,nw,cw=_new_writers(); rng=random.Random(99)
+    hs=TERRAIN_SIZE*TERRAIN_SCALE/2
+    def B(cx,cy,cz,sx,sy,sz,r,g,b): _box_tris(tris,_add_box(vw,nw,cw,cx,cy,cz,sx,sy,sz,r,g,b))
+    for _ in range(count):
+        x=rng.uniform(-hs*.8,hs*.8); z=rng.uniform(-hs*.8,hs*.8)
+        if abs(x)<8 and abs(z)<8: continue
+        s=rng.uniform(.15,.55); h=rng.uniform(.10,.30)
+        r=int(rng.uniform(120,160)); g=int(rng.uniform(100,130)); b=int(rng.uniform(70,95))
+        B(x,h/2,z,s,h,s*.7,r,g,b)
+    return _build_mesh(vdata,tris)
+
+def make_river() -> NodePath:
+    vdata,tris,vw,nw,cw=_new_writers()
+    pts=[(-100,-32),(-60,-30),(-20,-28),(20,-26),(60,-24),(100,-22)]; W=5.
+    for i in range(len(pts)-1):
+        ax,ay=pts[i]; bx,by=pts[i+1]
+        dx,dy=vnorm2(bx-ax,by-ay); px,py=-dy,dx
+        base=vw.getWriteRow()
+        for (vx,vy,vz) in [(ax-px*W,ay-py*W,.04),(ax+px*W,ay+py*W,.04),
+                            (bx+px*W,by+py*W,.04),(bx-px*W,by-py*W,.04)]:
+            vw.addData3(vx,vy,vz); nw.addData3(0,0,1); cw.addData4(.28,.36,.46,1)
+        tris.addVertices(base,base+1,base+2); tris.addVertices(base,base+2,base+3)
+    return _build_mesh(vdata,tris,two_sided=True)
+
+def make_scrub_cover(count=800) -> NodePath:
+    vdata,tris,vw,nw,cw=_new_writers(); rng=random.Random(77)
+    hs=TERRAIN_SIZE*TERRAIN_SCALE/2
+    for _ in range(count):
+        x=rng.uniform(-hs*.9,hs*.9); z=rng.uniform(-hs*.9,hs*.9)
+        pw=rng.uniform(.3,1.2); pd=rng.uniform(.2,.8)
+        t=rng.random()
+        r=0.48+t*.08+rng.uniform(-.04,.04); g=0.38+t*.05+rng.uniform(-.03,.03)
+        b=0.16+t*.02+rng.uniform(-.02,.02)
+        base=vw.getWriteRow()
+        for (vx,vy,vz) in [(x-pw,z-pd,.01),(x+pw,z-pd,.01),(x+pw,z+pd,.01),(x-pw,z+pd,.01)]:
+            vw.addData3(vx,vy,vz); nw.addData3(0,0,1)
+            cw.addData4(max(0,min(1,r)),max(0,min(1,g)),max(0,min(1,b)),1)
+        tris.addVertices(base,base+1,base+2); tris.addVertices(base,base+2,base+3)
+    return _build_mesh(vdata,tris,two_sided=True)
 
 def make_muzzle_flash() -> NodePath:
-    vdata, tris, vw, nw, cw = _new_writers()
-    base=vw.getWriteRow()
-    for (vx,vy,vz) in [(-0.18,-0.18,0),(0.18,-0.18,0),(0.18,0.18,0),(-0.18,0.18,0)]:
-        vw.addData3(vx,vy,vz); nw.addData3(0,-1,0); cw.addData4(1.0,0.85,0.15,1)
+    vdata,tris,vw,nw,cw=_new_writers(); base=vw.getWriteRow()
+    for (vx,vy,vz) in [(-.18,-.18,0),(.18,-.18,0),(.18,.18,0),(-.18,.18,0)]:
+        vw.addData3(vx,vy,vz); nw.addData3(0,-1,0); cw.addData4(1.,.85,.15,1)
     tris.addVertices(base,base+1,base+2); tris.addVertices(base,base+2,base+3)
-    np=_build_mesh(vdata,tris); np.setTwoSided(True); np.setBillboardPointEye()
-    return np
+    np=_build_mesh(vdata,tris,two_sided=True); np.setBillboardPointEye(); return np
 
 
 # ── Dust ───────────────────────────────────────────────────────────────────────
 
 @dataclass
 class DustPuff:
-    np: NodePath
-    vx: float; vy: float; vz: float
-    life: float; max_life: float
+    np:NodePath; vx:float; vy:float; vz:float; life:float; max_life:float
 
-def spawn_dust(parent: NodePath, x: float, y: float) -> DustPuff:
-    vdata, tris, vw, nw, cw = _new_writers()
-    base=vw.getWriteRow(); s=random.uniform(0.15,0.40)
+def spawn_dust(parent,x,y,smoke=False) -> DustPuff:
+    vdata,tris,vw,nw,cw=_new_writers(); base=vw.getWriteRow()
+    s=random.uniform(.20,.55)
+    rc,gc,bc=(0.65,0.56,0.38) if not smoke else (0.72,0.68,0.58)
     for (vx,vy,vz) in [(-s,-s,0),(s,-s,0),(s,s,0),(-s,s,0)]:
-        vw.addData3(vx,vy,vz); nw.addData3(0,-1,0); cw.addData4(0.60,0.52,0.36,0.7)
+        vw.addData3(vx,vy,vz); nw.addData3(0,-1,0); cw.addData4(rc,gc,bc,.7)
     tris.addVertices(base,base+1,base+2); tris.addVertices(base,base+2,base+3)
-    np=_build_mesh(vdata,tris); np.setTwoSided(True); np.setBillboardPointEye()
+    np=_build_mesh(vdata,tris,two_sided=True); np.setBillboardPointEye()
     np.reparentTo(parent)
-    np.setPos(x+random.uniform(-0.5,0.5),y+random.uniform(-0.5,0.5),random.uniform(0.1,0.8))
-    lt=random.uniform(0.4,1.0)
-    return DustPuff(np=np,vx=random.uniform(-0.4,0.4),vy=random.uniform(-0.4,0.4),
-                    vz=random.uniform(0.3,0.8),life=lt,max_life=lt)
+    np.setPos(x+random.uniform(-.6,.6),y+random.uniform(-.6,.6),random.uniform(.1,1.))
+    lt=random.uniform(.4,1.2)
+    return DustPuff(np=np,vx=random.uniform(-.5,.5),vy=random.uniform(-.5,.5),
+                    vz=random.uniform(.4,1.),life=lt,max_life=lt)
 
 
 # ── Entities ───────────────────────────────────────────────────────────────────
 
-class WeaponType(Enum):
-    CARBINE = auto(); COLT = auto()
+class WeaponType(Enum): CARBINE=auto(); COLT=auto()
 
 @dataclass
 class Bullet:
-    x:float; y:float; dx:float; dy:float
-    speed:float=30.0; damage:int=80; range:float=60.0
-    dist:float=0.0; alive:bool=True; is_enemy:bool=False
+    x:float;y:float;dx:float;dy:float
+    speed:float=30.;damage:int=80;range:float=60.
+    dist:float=0.;alive:bool=True;is_enemy:bool=False
 
 @dataclass
 class TrooperEnt:
-    x:float; y:float
-    health:int=TROOPER_HP; alive:bool=True
-    fire_timer:float=0.0; np:Optional[NodePath]=None
+    x:float;y:float;health:int=TROOPER_HP;alive:bool=True
+    fire_timer:float=0.;np:Optional[NodePath]=None
+    arm_np:Optional[NodePath]=None   # right_arm pivot for aim animation
+    hp_bar:Optional[NodePath]=None   # 3D billboard quad above head
 
 @dataclass
 class EnemyEnt:
-    x:float; y:float
-    health:int=ENEMY_HP; alive:bool=True
-    speed:float=9.0; fire_timer:float=0.0
-    state:str="charge"; np:Optional[NodePath]=None
-    dust_timer:float=0.0
+    x:float;y:float;health:int=ENEMY_HP;alive:bool=True
+    speed:float=9.;fire_timer:float=0.;state:str="charge"
+    np:Optional[NodePath]=None;dust_timer:float=0.
+    anim_t:float=0.                  # horse leg animation timer
 
 
 # ── Game ───────────────────────────────────────────────────────────────────────
@@ -388,201 +589,222 @@ class LittleBighornGame(ShowBase):
 
     def __init__(self):
         super().__init__()
-        props = WindowProperties()
-        props.setMouseMode(WindowProperties.MConfined)
-        props.setCursorHidden(True)
-        self.win.requestProperties(props)
-        self.disableMouse()
-
+        props=WindowProperties()
+        props.setMouseMode(WindowProperties.MConfined); props.setCursorHidden(True)
+        self.win.requestProperties(props); self.disableMouse()
         self.camera.setPos(0,0,CAM_HEIGHT)
-        self._yaw=0.0; self._pitch=0.0
-        self._last_mx=None; self._last_my=None
+        self._yaw=0.;self._pitch=0.;self._last_mx=None;self._last_my=None
+        self._shake=0.
 
-        # ── Lighting ──────────────────────────────────────────────────────────
-        sun=DirectionalLight("sun"); sun.setColor(LColor(1.0,0.92,0.72,1))
-        sun_np=self.render.attachNewNode(sun); sun_np.setHpr(215,-48,0)
+        self.render.setShaderAuto()
+
+        sun=DirectionalLight("sun"); sun.setColor(LColor(1.02,.94,.74,1))
+        sun.setShadowCaster(True,4096,4096)
+        sun.getLens().setNear(1.); sun.getLens().setFar(500)
+        sun.getLens().setFilmSize(120,120)
+        sun_np=self.render.attachNewNode(sun); sun_np.setHpr(215,-52,0)
         self.render.setLight(sun_np)
 
-        fill=DirectionalLight("fill"); fill.setColor(LColor(0.32,0.28,0.18,1))
-        fill_np=self.render.attachNewNode(fill); fill_np.setHpr(35,20,0)
+        fill=DirectionalLight("fill"); fill.setColor(LColor(.28,.24,.16,1))
+        fill_np=self.render.attachNewNode(fill); fill_np.setHpr(35,22,0)
         self.render.setLight(fill_np)
 
-        amb=AmbientLight("amb"); amb.setColor(LColor(0.18,0.16,0.12,1))
+        amb=AmbientLight("amb"); amb.setColor(LColor(.16,.15,.12,1))
         amb_np=self.render.attachNewNode(amb); self.render.setLight(amb_np)
 
-        # ── Fog ───────────────────────────────────────────────────────────────
-        fog=Fog("haze"); fog.setColor(0.58,0.52,0.38)
-        fog.setLinearRange(30.0,160.0); self.render.setFog(fog)
+        fog=Fog("haze"); fog.setColor(.60,.54,.40)
+        fog.setLinearRange(35.,180.); self.render.setFog(fog)
+        self.setBackgroundColor(.50,.56,.64)
 
-        self.setBackgroundColor(0.46,0.52,0.62)
+        self._setup_post_fx()
+        self._setup_terrain()
 
-        # ── Load / cache 3D models ────────────────────────────────────────────
-        self._using_assets = False
-        self._mdl_cache: dict = {}
+        self._world_np=self.render.attachNewNode("world")
+        make_sky_dome(self._world_np); make_sun_disc(self._world_np)
+        make_grass_tufts(2000).reparentTo(self._world_np)
+        make_rocks(120).reparentTo(self._world_np)
+        make_river().reparentTo(self._world_np)
+        make_scrub_cover(800).reparentTo(self._world_np)
+
+        # ── Load asset models ─────────────────────────────────────────────────
+        self._using_assets=False; self._mdl_cache={}
         self._load_models()
 
-        # ── Terrain ───────────────────────────────────────────────────────────
-        self._tex_grass=make_grass_texture(); self._tex_hill=make_hill_texture()
-        self._build_world()
+        # ── Viewmodel guns attached to camera ─────────────────────────────────
+        self._vm_carbine = make_viewmodel_carbine()
+        self._vm_carbine.reparentTo(self.camera)
+        self._vm_carbine.setPos(0.28, 0.70, -0.24)
+        self._vm_carbine.setHpr(0, -8, 0)
 
-        # ── Dust + muzzle flash ───────────────────────────────────────────────
+        self._vm_colt = make_viewmodel_colt()
+        self._vm_colt.reparentTo(self.camera)
+        self._vm_colt.setPos(0.24, 0.52, -0.22)
+        self._vm_colt.setHpr(0, -5, 0)
+        self._vm_colt.hide()
+
+        self._vm_bob_t = 0.  # walking bob timer
+
+        # ── Dust + muzzle ─────────────────────────────────────────────────────
         self._dust_root=self.render.attachNewNode("dust")
-        self._dust_puffs: List[DustPuff]=[]
-        self._muzzle_np=make_muzzle_flash(); self._muzzle_np.reparentTo(self.camera)
-        self._muzzle_np.setPos(0.35,2.8,-0.15); self._muzzle_np.hide()
-        self._muzzle_t=0.0
+        self._dust_puffs:List[DustPuff]=[]
+        self._muzzle_np=make_muzzle_flash()
+        self._muzzle_np.reparentTo(self.camera)
+        self._muzzle_np.setPos(.35,1.0,-.18); self._muzzle_np.hide()
+        self._muzzle_t=0.
 
-        # ── State + HUD ───────────────────────────────────────────────────────
         self._state="title"; self._setup_game_state(); self._build_hud()
 
-        # ── Input ─────────────────────────────────────────────────────────────
         self.accept("escape",self._on_escape); self.accept("r",self._on_reload)
         self.accept("tab",self._on_switch_weapon)
         self.accept("space",self._on_fire_key); self.accept("mouse1",self._on_fire_key)
         self.accept("space-up",self._clear_fire); self.accept("mouse1-up",self._clear_fire)
         self._keys={"w":False,"s":False,"a":False,"d":False}
         for k in self._keys:
-            self.accept(k,       lambda key=k: self._key_down(key))
-            self.accept(k+"-up", lambda key=k: self._key_up(key))
+            self.accept(k,       lambda key=k:self._key_down(key))
+            self.accept(k+"-up", lambda key=k:self._key_up(key))
         self._fire_held=False
         self.taskMgr.add(self._update_task,"update")
         self._show_title()
 
+    # ── Post-FX ───────────────────────────────────────────────────────────────
+
+    def _setup_post_fx(self):
+        try:
+            f=CommonFilters(self.win,self.cam)
+            f.setBloom(blend=(.3,.4,.3,0),mintrigger=0.72,maxtrigger=1.,desat=0.4,intensity=1.2,size="medium")
+            f.setAmbientOcclusion(numsamples=16,radius=0.025,amount=2.2,strength=0.6,falloff=0.0002)
+            self._filters=f; print("[render] Post-FX: bloom + SSAO")
+        except Exception as e:
+            print(f"[render] Post-FX unavailable: {e}"); self._filters=None
+
+    # ── Terrain ───────────────────────────────────────────────────────────────
+
+    def _setup_terrain(self):
+        self._hmap=make_heightmap(TERRAIN_SIZE)
+        TERRAIN_SZ=16.; TERRAIN_MID=8.
+        world_size=TERRAIN_SIZE*TERRAIN_SCALE
+
+        terrain=GeoMipTerrain("tc")
+        terrain.setHeightfield(self._hmap)
+        terrain.setBlockSize(32); terrain.setNear(40); terrain.setFar(200)
+        terrain.setFocalPoint(self.camera)
+        col_root=terrain.getRoot(); col_root.reparentTo(self.render)
+        col_root.setSz(TERRAIN_SZ); col_root.setPos(-world_size/2,-world_size/2,-TERRAIN_MID)
+        terrain.generate(); col_root.hide()
+
+        self._terrain=terrain; self._terrain_root=col_root
+        self._terrain_world_size=world_size
+        self._terrain_sz=TERRAIN_SZ; self._terrain_mid=TERRAIN_MID
+
+        vis=build_terrain_vis(self._hmap,TERRAIN_SZ,TERRAIN_MID,world_size)
+        vis.reparentTo(self.render); self._terrain_vis=vis
+
+    def _terrain_height(self,x,y) -> float:
+        try:
+            ws=self._terrain_world_size
+            nx=max(0.,min(1.,(x+ws/2)/ws)); ny=max(0.,min(1.,(y+ws/2)/ws))
+            return self._terrain.getElevation(nx,ny)*self._terrain_sz-self._terrain_mid
+        except: return 0.
+
     # ── Asset loading ──────────────────────────────────────────────────────────
 
     def _load_models(self):
-        """Try to load .glb models from the models/ folder.
-           Falls back to procedural meshes if files are missing."""
-        MODELS_DIR.mkdir(exist_ok=True)
-
-        found_any = False
+        MODELS_DIR.mkdir(exist_ok=True); found=False
         for key in ("trooper","horse","warrior","dead"):
-            # Try several extensions in priority order
-            for ext in (".glb",".gltf",".egg",".bam",".obj"):
-                path = MODELS_DIR / (key + ext)
+            for ext in (".glb",".gltf",".egg",".bam"):
+                path=MODELS_DIR/(key+ext)
                 if path.exists():
                     try:
-                        mdl = self.loader.loadModel(str(path))
+                        mdl=self.loader.loadModel(str(path))
                         if mdl:
-                            scale, z_off, h_off = MODEL_CFG.get(key,(1.0,0.0,0.0))
-                            mdl.setScale(scale)
-                            mdl.setZ(z_off)
-                            mdl.setH(h_off)
-                            self._mdl_cache[key] = mdl
-                            mdl.detachNode()   # keep in cache, not in scene
-                            found_any = True
-                            print(f"[assets] Loaded {key} from {path.name}")
-                            break
-                    except Exception as e:
-                        print(f"[assets] Failed to load {path.name}: {e}")
+                            sc,zo,ho=MODEL_CFG.get(key,(1.,0.,0.))
+                            mdl.setScale(sc); mdl.setZ(zo); mdl.setH(ho)
+                            self._mdl_cache[key]=mdl; mdl.detachNode()
+                            found=True; print(f"[assets] {key} <- {path.name}"); break
+                    except Exception as e: print(f"[assets] {key}: {e}")
+        if found: self._using_assets=True; print("[assets] shading active")
+        else: print(f"[assets] Drop .glb into: {MODELS_DIR}")
 
-        if found_any:
-            self._using_assets = True
-            # Enable per-pixel lighting — transforms how shading looks on real meshes
-            self.render.setShaderAuto()
-            print("[assets] Per-pixel shader enabled")
-        else:
-            print("[assets] No models found in models/ — using procedural geometry")
-            print(f"[assets] Drop .glb files into: {MODELS_DIR}")
+    def _make_trooper(self,parent) -> tuple:
+        """Returns (root_np, arm_pivot_np)."""
+        if "trooper" in self._mdl_cache:
+            np=self._mdl_cache["trooper"].copyTo(parent)
+            return np, None
+        root=make_trooper_articulated(parent)
+        arm=root.find("**/right_arm")
+        return root, (arm if not arm.isEmpty() else None)
 
-    def _instance_model(self, key: str, parent: NodePath,
-                        fallback_fn) -> NodePath:
-        """Return a fresh instance of a model, or build procedural fallback."""
-        if key in self._mdl_cache:
-            inst = self._mdl_cache[key].copyTo(parent)
-            return inst
-        else:
-            mdl = fallback_fn()
-            mdl.reparentTo(parent)
-            return mdl
-
-    def _make_trooper(self, parent: NodePath) -> NodePath:
-        return self._instance_model("trooper", parent, make_trooper_model_proc)
-
-    def _make_enemy(self, parent: NodePath) -> NodePath:
-        """Mounted enemy: horse + warrior rider, or single warrior fallback."""
-        root = parent.attachNewNode("mounted")
+    def _make_enemy(self,parent) -> NodePath:
+        root=parent.attachNewNode("mounted")
         if "horse" in self._mdl_cache and "warrior" in self._mdl_cache:
-            horse  = self._mdl_cache["horse"].copyTo(root)
-            rider  = self._mdl_cache["warrior"].copyTo(root)
-            # Rider sits on horse — adjust z so rider is on the saddle
-            # Tune MODEL_CFG["warrior"] z_offset if needed for your specific model
-            rider.setZ(rider.getZ() + 1.85)
+            self._mdl_cache["horse"].copyTo(root)
+            r=self._mdl_cache["warrior"].copyTo(root); r.setZ(r.getZ()+1.85)
         elif "horse" in self._mdl_cache:
-            # Horse only, add procedural warrior on top
-            horse = self._mdl_cache["horse"].copyTo(root)
-            rider = make_warrior_model_proc(); rider.reparentTo(root)
-            rider.setZ(1.85)
+            self._mdl_cache["horse"].copyTo(root)
+            r=make_warrior_model_proc(); r.reparentTo(root); r.setZ(1.85)
         else:
-            # Full procedural fallback
-            horse  = make_horse_model_proc();   horse.reparentTo(root)
-            rider  = make_warrior_model_proc(); rider.reparentTo(root)
-            rider.setZ(1.85)
+            make_horse_articulated(root)
+            r=make_warrior_model_proc(); r.reparentTo(root); r.setZ(1.85)
         return root
 
-    def _make_dead(self, parent: NodePath) -> NodePath:
-        return self._instance_model("dead", parent, make_dead_model_proc)
+    def _make_dead(self,parent) -> NodePath:
+        if "dead" in self._mdl_cache: return self._mdl_cache["dead"].copyTo(parent)
+        mdl=make_dead_model_proc(); mdl.reparentTo(parent); return mdl
 
-    # ── World ──────────────────────────────────────────────────────────────────
+    # ── Game state ────────────────────────────────────────────────────────────
 
-    def _build_world(self):
-        self._world_np=self.render.attachNewNode("world")
-        ground=make_ground_node(GROUND_SIZE,self._tex_grass)
-        ground.reparentTo(self._world_np)
-        rng=random.Random(42)
-        for i in range(HILL_COUNT):
-            ang=rng.uniform(0,math.pi*2); dist=rng.uniform(18,75)
-            cx=math.cos(ang)*dist; cz=math.sin(ang)*dist
-            rx=rng.uniform(6,16); rz=rng.uniform(4,11); h=rng.uniform(2.5,8.0)
-            hn=make_hill_geom(cx,cz,rx,rz,h,self._tex_hill,seed=i*17)
-            hn.reparentTo(self._world_np)
-        tufts=make_grass_tufts(GROUND_SIZE,count=700); tufts.reparentTo(self._world_np)
-        river=make_river_segment(); river.reparentTo(self._world_np)
+    def _setup_game_state(self):
+        self._cam_x=0.;self._cam_z=0.;self._yaw=0.;self._pitch=0.
+        self._hp=100;self._kills=0;self._elapsed=0.;self._wave=1;self._wave_t=0.
+        self._weapon=WeaponType.CARBINE
+        self._carb_loaded=1;self._carb_ammo=55
+        self._colt_loaded=COLT_CAP;self._colt_ammo=24
+        self._reload_t=0.;self._reload_time=0.;self._reloading=False;self._fire_cd=0.
+        self._bullets:List[Bullet]=[]
+        self._troopers:List[TrooperEnt]=[]
+        self._enemies:List[EnemyEnt]=[]
 
     def _clear_entities(self):
+        # Remove old HP bars (3D nodes — just removed with entity root)
+        if hasattr(self,"_troopers"):
+            for t in self._troopers:
+                if t.hp_bar and not t.hp_bar.isEmpty():
+                    t.hp_bar.removeNode()
         if hasattr(self,"_entity_root"): self._entity_root.removeNode()
         self._entity_root=self.render.attachNewNode("entities")
         for d in self._dust_puffs:
             if d.np and not d.np.isEmpty(): d.np.removeNode()
         self._dust_puffs.clear()
 
-    # ── Game state ─────────────────────────────────────────────────────────────
-
-    def _setup_game_state(self):
-        self._cam_x=0.0; self._cam_z=0.0; self._yaw=0.0; self._pitch=0.0
-        self._hp=100; self._kills=0; self._elapsed=0.0; self._wave=1; self._wave_t=0.0
-        self._weapon=WeaponType.CARBINE
-        self._carb_loaded=1; self._carb_ammo=55
-        self._colt_loaded=COLT_CAP; self._colt_ammo=24
-        self._reload_t=0.0; self._reload_time=0.0; self._reloading=False; self._fire_cd=0.0
-        self._bullets: List[Bullet]=[]; self._troopers: List[TrooperEnt]=[]
-        self._enemies: List[EnemyEnt]=[]
-
     def _start_game(self):
         self._setup_game_state(); self._clear_entities()
         rng=random.Random(99)
         for i in range(TROOPER_COUNT):
-            ang=i/TROOPER_COUNT*math.pi*2; d=rng.uniform(2.5,5.0)
+            ang=i/TROOPER_COUNT*math.pi*2; d=rng.uniform(2.5,5.)
             tx=math.cos(ang)*d; tz=math.sin(ang)*d
-            mdl=self._make_trooper(self._entity_root); mdl.setPos(tx,tz,0)
-            self._troopers.append(TrooperEnt(x=tx,y=tz,np=mdl))
+            np,arm=self._make_trooper(self._entity_root)
+            th=self._terrain_height(tx,tz); np.setPos(tx,tz,th)
+            self._troopers.append(TrooperEnt(x=tx,y=tz,np=np,arm_np=arm))
         self._spawn_wave(INIT_ENEMIES)
-        self._cam_x=0.0; self._cam_z=0.0; self._yaw=0.0; self._pitch=0.0
-        self.camera.setPos(0,0,CAM_HEIGHT); self.camera.setHpr(0,0,0)
+        self._cam_x=0.;self._cam_z=0.;self._yaw=0.;self._pitch=0.
+        h0=self._terrain_height(0.,0.)
+        self.camera.setPos(0.,0.,h0+CAM_HEIGHT); self.camera.setHpr(0,0,0)
         if self.mouseWatcherNode.hasMouse():
             self.win.movePointer(0,self.win.getXSize()//2,self.win.getYSize()//2)
+        self._vm_carbine.show(); self._vm_colt.hide()
         self._update_hud_weapon()
 
-    def _spawn_wave(self, count):
+    def _spawn_wave(self,count):
         rng=random.Random(int(self._elapsed*100)+len(self._enemies))
         for _ in range(count):
             ang=rng.uniform(0,math.pi*2); dist=rng.uniform(SPAWN_MIN,SPAWN_MAX)
             ex=self._cam_x+math.cos(ang)*dist; ez=self._cam_z+math.sin(ang)*dist
-            spd=rng.uniform(ENEMY_SPD_MIN,ENEMY_SPD_MAX)*(1+self._wave*0.07)
-            mdl=self._make_enemy(self._entity_root); mdl.setPos(ex,ez,0)
+            spd=rng.uniform(ENEMY_SPD_MIN,ENEMY_SPD_MAX)*(1+self._wave*.07)
+            mdl=self._make_enemy(self._entity_root)
+            mdl.setPos(ex,ez,self._terrain_height(ex,ez))
             self._enemies.append(EnemyEnt(x=ex,y=ez,speed=spd,np=mdl))
 
-    # ── Input ──────────────────────────────────────────────────────────────────
+    # ── Input ─────────────────────────────────────────────────────────────────
 
     def _key_down(self,k): self._keys[k]=True
     def _key_up(self,k):   self._keys[k]=False
@@ -596,39 +818,46 @@ class LittleBighornGame(ShowBase):
     def _on_reload(self):
         if self._state!="playing" or self._reloading: return
         if self._weapon==WeaponType.CARBINE and self._carb_ammo<=0: return
-        if self._weapon==WeaponType.COLT    and self._colt_ammo<=0: return
-        self._reload_time=(CARBINE_RELOAD if self._weapon==WeaponType.CARBINE else COLT_RELOAD)
-        self._reload_t=0.0; self._reloading=True
+        if self._weapon==WeaponType.COLT and self._colt_ammo<=0: return
+        self._reload_time=CARBINE_RELOAD if self._weapon==WeaponType.CARBINE else COLT_RELOAD
+        self._reload_t=0.; self._reloading=True
 
     def _on_switch_weapon(self):
         if self._state!="playing" or self._reloading: return
-        self._weapon=(WeaponType.COLT if self._weapon==WeaponType.CARBINE else WeaponType.CARBINE)
+        self._weapon=WeaponType.COLT if self._weapon==WeaponType.CARBINE else WeaponType.CARBINE
         self._update_hud_weapon()
+        if self._weapon==WeaponType.CARBINE:
+            self._vm_carbine.show(); self._vm_colt.hide()
+        else:
+            self._vm_carbine.hide(); self._vm_colt.show()
 
     def _try_fire(self):
         if self._reloading or self._fire_cd>0: return
         if self._weapon==WeaponType.CARBINE:
             if self._carb_loaded<=0: self._on_reload(); return
-            self._carb_loaded-=1; dmg=CARBINE_DMG; rng_w=CARBINE_RANGE; self._fire_cd=0.55
+            self._carb_loaded-=1; dmg=CARBINE_DMG; rng_w=CARBINE_RANGE; self._fire_cd=.55
         else:
             if self._colt_loaded<=0: self._on_reload(); return
-            self._colt_loaded-=1; dmg=COLT_DMG; rng_w=COLT_RANGE; self._fire_cd=0.18
-        sp=0.03 if self._weapon==WeaponType.CARBINE else 0.07
-        yaw_r=math.radians(self._yaw)
-        dx=-math.sin(yaw_r)+random.gauss(0,sp); dy=math.cos(yaw_r)+random.gauss(0,sp)
+            self._colt_loaded-=1; dmg=COLT_DMG; rng_w=COLT_RANGE; self._fire_cd=.18
+        sp=.03 if self._weapon==WeaponType.CARBINE else .07
+        yr=math.radians(self._yaw)
+        dx=-math.sin(yr)+random.gauss(0,sp); dy=math.cos(yr)+random.gauss(0,sp)
         dx,dy=vnorm2(dx,dy)
-        self._bullets.append(Bullet(x=self._cam_x+dx*0.9,y=self._cam_z+dy*0.9,
-                                     dx=dx,dy=dy,speed=42.0,damage=dmg,range=rng_w))
-        self._muzzle_np.show(); self._muzzle_t=0.08
-        for _ in range(2):
-            p=spawn_dust(self._dust_root,self._cam_x+dx*1.0,self._cam_z+dy*1.0)
-            p.np.setColor(0.72,0.68,0.58,0.6); self._dust_puffs.append(p)
+        self._bullets.append(Bullet(x=self._cam_x+dx*.9,y=self._cam_z+dy*.9,
+                                     dx=dx,dy=dy,speed=44.,damage=dmg,range=rng_w))
+        self._muzzle_np.show(); self._muzzle_t=.08; self._shake=.12
+        # Viewmodel kick
+        vm=self._vm_carbine if self._weapon==WeaponType.CARBINE else self._vm_colt
+        vm.setP(vm.getP()-8.)
+        for _ in range(3):
+            p=spawn_dust(self._dust_root,self._cam_x+dx*1.1,self._cam_z+dy*1.1,smoke=True)
+            self._dust_puffs.append(p)
         self._update_hud_ammo()
 
-    # ── Update ─────────────────────────────────────────────────────────────────
+    # ── Update ────────────────────────────────────────────────────────────────
 
-    def _update_task(self, task):
-        dt=min(globalClock.getDt(),0.05)
+    def _update_task(self,task):
+        dt=min(globalClock.getDt(),.05)
         if self._state in ("title","gameover"): return Task.cont
 
         # Mouse look
@@ -638,39 +867,64 @@ class LittleBighornGame(ShowBase):
                 self._yaw  -=(mx-self._last_mx)*MOUSE_SENS*100
                 self._pitch  =max(-80,min(80,self._pitch+(my-self._last_my)*MOUSE_SENS*80))
             self._last_mx=mx; self._last_my=my
-            cx=self.win.getXSize()//2; cy=self.win.getYSize()//2
-            self.win.movePointer(0,cx,cy); self._last_mx=0.0; self._last_my=0.0
-        self.camera.setHpr(self._yaw,self._pitch,0)
+            self.win.movePointer(0,self.win.getXSize()//2,self.win.getYSize()//2)
+            self._last_mx=0.; self._last_my=0.
+
+        # Screen shake decay
+        self._shake=max(0.,self._shake-dt*3)
+        sx=random.uniform(-1,1)*self._shake*2. if self._shake>0 else 0.
+        sy=random.uniform(-1,1)*self._shake*1.2 if self._shake>0 else 0.
+        self.camera.setHpr(self._yaw+sx,self._pitch+sy,0)
 
         # Movement
-        yaw_r=math.radians(self._yaw)
-        fwd_x=-math.sin(yaw_r); fwd_z=math.cos(yaw_r)
-        rgt_x=fwd_z; rgt_z=-fwd_x
-        mv_x=mv_z=0.0
-        if self._keys["w"]: mv_x+=fwd_x; mv_z+=fwd_z
-        if self._keys["s"]: mv_x-=fwd_x; mv_z-=fwd_z
-        if self._keys["a"]: mv_x-=rgt_x; mv_z-=rgt_z
-        if self._keys["d"]: mv_x+=rgt_x; mv_z+=rgt_z
-        if mv_x or mv_z:
+        yr=math.radians(self._yaw)
+        fx=-math.sin(yr); fz=math.cos(yr); rx=fz; rz=-fx
+        mv_x=mv_z=0.
+        moving=False
+        if self._keys["w"]: mv_x+=fx;mv_z+=fz; moving=True
+        if self._keys["s"]: mv_x-=fx;mv_z-=fz; moving=True
+        if self._keys["a"]: mv_x-=rx;mv_z-=rz; moving=True
+        if self._keys["d"]: mv_x+=rx;mv_z+=rz; moving=True
+        if moving:
             nmx,nmz=vnorm2(mv_x,mv_z)
             self._cam_x+=nmx*PLAYER_SPEED*dt; self._cam_z+=nmz*PLAYER_SPEED*dt
-            if random.random()<0.15:
+            if random.random()<.12:
                 self._dust_puffs.append(spawn_dust(self._dust_root,self._cam_x,self._cam_z))
-        self.camera.setPos(self._cam_x,self._cam_z,CAM_HEIGHT)
+
+        # Camera follows terrain
+        ground_z=self._terrain_height(self._cam_x,self._cam_z)
+        self.camera.setPos(self._cam_x,self._cam_z,ground_z+CAM_HEIGHT)
+
+        # Viewmodel bob when moving
+        if moving:
+            self._vm_bob_t+=dt*8.
+            bob_z=math.sin(self._vm_bob_t)*0.012
+            bob_x=math.cos(self._vm_bob_t*0.5)*0.006
+        else:
+            bob_z=0.; bob_x=0.
+        vm=self._vm_carbine if self._weapon==WeaponType.CARBINE else self._vm_colt
+        base_pos=(0.28,0.70,-0.24) if self._weapon==WeaponType.CARBINE else (0.24,0.52,-0.22)
+        vm.setPos(base_pos[0]+bob_x, base_pos[1], base_pos[2]+bob_z)
+        # Viewmodel recoil recovery
+        cur_p=vm.getP(); vm.setP(cur_p+(0.-cur_p)*min(1.,dt*12.))
+
+        # Terrain LOD update
+        self._terrain.setFocalPoint(self.camera)
+        if int(self._elapsed*4)%4==0: self._terrain.update()
 
         # Muzzle flash
         if self._muzzle_t>0:
-            self._muzzle_t=max(0.0,self._muzzle_t-dt)
+            self._muzzle_t=max(0.,self._muzzle_t-dt)
             if self._muzzle_t<=0: self._muzzle_np.hide()
 
-        # Fire / reload
-        self._fire_cd=max(0.0,self._fire_cd-dt)
+        self._fire_cd=max(0.,self._fire_cd-dt)
         if self._fire_held: self._try_fire()
+
         if self._reloading:
             self._reload_t+=dt
             self._hud_reload_bar["value"]=self._reload_t/self._reload_time*100
             if self._reload_t>=self._reload_time:
-                self._reloading=False; self._reload_t=0.0; self._hud_reload_bar["value"]=0
+                self._reloading=False; self._reload_t=0.; self._hud_reload_bar["value"]=0
                 if self._weapon==WeaponType.CARBINE:
                     add=min(self._carb_ammo,1); self._carb_loaded=add; self._carb_ammo-=add
                 else:
@@ -687,7 +941,7 @@ class LittleBighornGame(ShowBase):
             t=p.life/p.max_life
             px2,py2,pz2=p.np.getPos()
             p.np.setPos(px2+p.vx*dt,py2+p.vy*dt,pz2+p.vz*dt)
-            p.np.setAlphaScale(t*0.8); s=1.0+(1.0-t)*1.5; p.np.setScale(s)
+            p.np.setAlphaScale(t*.85); s=1.+(1.-t)*2.; p.np.setScale(s)
             alive_dust.append(p)
         self._dust_puffs=alive_dust
 
@@ -705,12 +959,16 @@ class LittleBighornGame(ShowBase):
                             if e.np:
                                 e.np.removeNode(); e.np=None
                                 dead=self._make_dead(self._entity_root)
-                                dead.setPos(e.x,e.y,0); dead.setH(random.uniform(0,360))
+                                dead.setPos(e.x,e.y,self._terrain_height(e.x,e.y))
+                                dead.setH(random.uniform(0,360))
                         break
             else:
-                if vlen2(b.x-self._cam_x,b.y-self._cam_z)<0.9:
-                    self._hp-=b.damage; b.alive=False
-                    if self._hp<=0: self._state="gameover"; self._show_gameover()
+                if vlen2(b.x-self._cam_x,b.y-self._cam_z)<.9:
+                    self._hp-=b.damage; b.alive=False; self._shake=.20
+                    if self._hp<=0:
+                        self._hp=0
+                        if not any(t.alive for t in self._troopers):
+                            self._state="gameover"; self._show_gameover()
                     continue
                 for t in self._troopers:
                     if not t.alive: continue
@@ -718,181 +976,254 @@ class LittleBighornGame(ShowBase):
                         t.health-=b.damage; b.alive=False
                         if t.health<=0:
                             t.alive=False
+                            if t.hp_bar: t.hp_bar.hide()
                             if t.np:
                                 t.np.removeNode(); t.np=None
                                 dead=self._make_dead(self._entity_root)
-                                dead.setPos(t.x,t.y,0)
+                                dead.setPos(t.x,t.y,self._terrain_height(t.x,t.y))
+                            # Last trooper dead + player dead = game over
+                            if self._hp<=0 or not any(tr.alive for tr in self._troopers):
+                                self._state="gameover"; self._show_gameover()
                         break
         self._bullets=[b for b in self._bullets if b.alive]
 
-        # Enemy AI
+        # Enemy AI + horse leg animation
         alive_e=[e for e in self._enemies if e.alive]
         for e in alive_e:
             dx=self._cam_x-e.x; dz=self._cam_z-e.y; dist=vlen2(dx,dz)
             if e.state=="flank":
-                p2x,p2z=-dz/max(0.1,dist),dx/max(0.1,dist)
-                dx=dx*0.5+p2x*0.5; dz=dz*0.5+p2z*0.5
+                p2x,p2z=-dz/max(.1,dist),dx/max(.1,dist)
+                dx=dx*.5+p2x*.5; dz=dz*.5+p2z*.5
             if dist>ENEMY_ATK_R:
                 nx,nz=vnorm2(dx,dz); e.x+=nx*e.speed*dt; e.y+=nz*e.speed*dt
                 if e.np:
-                    e.np.setPos(e.x,e.y,0)
+                    eh=self._terrain_height(e.x,e.y)
+                    e.np.setPos(e.x,e.y,eh)
                     face=math.degrees(math.atan2(-dx,-dz)); e.np.setH(face)
+                    # Animate horse legs — alternate pairs
+                    e.anim_t+=dt*e.speed*1.2
+                    for name,phase in [("leg_fl",0.),("leg_br",0.),("leg_fr",math.pi),("leg_bl",math.pi)]:
+                        leg=e.np.find(f"**/{name}")
+                        if not leg.isEmpty():
+                            angle=math.sin(e.anim_t+phase)*28.
+                            leg.setR(angle)
                 e.dust_timer+=dt
-                if e.dust_timer>0.12:
-                    e.dust_timer=0.0
-                    self._dust_puffs.append(spawn_dust(self._dust_root,e.x,e.y))
+                if e.dust_timer>.10:
+                    e.dust_timer=0.; self._dust_puffs.append(spawn_dust(self._dust_root,e.x,e.y))
             if dist<ENEMY_ATK_R:
-                self._hp-=int(ENEMY_DMG*dt*2.5)
-                if self._hp<=0: self._state="gameover"; self._show_gameover()
+                self._hp-=int(ENEMY_DMG*dt*2.5); self._shake=.18
+                if self._hp<=0:
+                    self._hp=0
+                    if not any(t.alive for t in self._troopers):
+                        self._state="gameover"; self._show_gameover()
             e.fire_timer+=dt
-            if e.fire_timer>=1.0/ENEMY_RATE:
-                e.fire_timer=0.0
-                if dist<ENEMY_FIRE_R and random.random()<0.40:
-                    edx=self._cam_x-e.x+random.gauss(0,0.5)
-                    edz=self._cam_z-e.y+random.gauss(0,0.5)
+            if e.fire_timer>=1./ENEMY_RATE:
+                e.fire_timer=0.
+                if dist<ENEMY_FIRE_R and random.random()<.40:
+                    edx=self._cam_x-e.x+random.gauss(0,.5); edz=self._cam_z-e.y+random.gauss(0,.5)
                     edx,edz=vnorm2(edx,edz)
-                    self._bullets.append(Bullet(x=e.x+edx*0.6,y=e.y+edz*0.6,
-                        dx=edx,dy=edz,speed=20.0,damage=ENEMY_DMG,
-                        range=ENEMY_FIRE_R,is_enemy=True))
-            if random.random()<0.002:
+                    self._bullets.append(Bullet(x=e.x+edx*.6,y=e.y+edz*.6,
+                        dx=edx,dy=edz,speed=20.,damage=ENEMY_DMG,range=ENEMY_FIRE_R,is_enemy=True))
+            if random.random()<.002:
                 e.state="charge" if e.state=="flank" else "flank"
 
+        # Trooper melee damage + aim animation + HP bar update
         for t in self._troopers:
             if not t.alive: continue
             for e in alive_e:
-                if vlen2(e.x-t.x,e.y-t.y)<TROOPER_R+ENEMY_R+0.4:
-                    t.health-=int(ENEMY_DMG*dt*2.0)
+                if vlen2(e.x-t.x,e.y-t.y)<TROOPER_R+ENEMY_R+.4:
+                    t.health-=int(ENEMY_DMG*dt*2.)
                     if t.health<=0:
                         t.alive=False
+                        if t.hp_bar: t.hp_bar.hide()
                         if t.np:
                             t.np.removeNode(); t.np=None
                             dead=self._make_dead(self._entity_root)
-                            dead.setPos(t.x,t.y,0)
+                            dead.setPos(t.x,t.y,self._terrain_height(t.x,t.y))
+                        if self._hp<=0 or not any(tr.alive for tr in self._troopers):
+                            self._state="gameover"; self._show_gameover()
                     break
 
+        # Trooper fire + aim arm toward target
         for t in self._troopers:
             if not t.alive or not alive_e: continue
+
+            # Aim arm at nearest enemy
+            tgt=min(alive_e,key=lambda e:vlen2(e.x-t.x,e.y-t.y))
+            if t.arm_np and not t.arm_np.isEmpty():
+                tdx=tgt.x-t.x; tdz=tgt.y-t.y; tdist=vlen2(tdx,tdz)
+                # Rotate arm toward target — pivot is at shoulder, arm hangs down by default
+                # We want to raise the arm forward, so pitch is negative (arm tips forward/up)
+                aim_pitch = -min(75., max(30., 90. - tdist * 5.))
+                t.arm_np.setHpr(0., aim_pitch, 0.)
+
+            # Face toward nearest enemy
+            if t.np:
+                face_yaw=math.degrees(math.atan2(tgt.x-t.x,tgt.y-t.y))
+                t.np.setH(face_yaw)
+
+            # Fire
             t.fire_timer+=dt
-            if t.fire_timer>=1.0/TROOPER_RATE:
-                t.fire_timer=0.0
-                tgt=min(alive_e,key=lambda e:vlen2(e.x-t.x,e.y-t.y))
+            if t.fire_timer>=1./TROOPER_RATE:
+                t.fire_timer=0.
                 if vlen2(tgt.x-t.x,tgt.y-t.y)>38: continue
                 tdx,tdz=vnorm2(tgt.x-t.x,tgt.y-t.y)
-                tdx+=random.gauss(0,0.07); tdz+=random.gauss(0,0.07)
-                tdx,tdz=vnorm2(tdx,tdz)
-                self._bullets.append(Bullet(x=t.x+tdx*0.5,y=t.y+tdz*0.5,
-                    dx=tdx,dy=tdz,speed=38.0,damage=CARBINE_DMG,range=CARBINE_RANGE))
-                self._dust_puffs.append(spawn_dust(self._dust_root,t.x,t.y))
+                tdx+=random.gauss(0,.07); tdz+=random.gauss(0,.07); tdx,tdz=vnorm2(tdx,tdz)
+                self._bullets.append(Bullet(x=t.x+tdx*.5,y=t.y+tdz*.5,
+                    dx=tdx,dy=tdz,speed=38.,damage=CARBINE_DMG,range=CARBINE_RANGE))
+                self._dust_puffs.append(spawn_dust(self._dust_root,t.x,t.y,smoke=True))
+
+        # HP bars disabled — removed for now
 
         self._elapsed+=dt; self._wave_t+=dt
         if self._wave_t>=WAVE_TIME:
-            self._wave_t=0.0; self._wave+=1
-            self._spawn_wave(WAVE_ADD+self._wave*2)
+            self._wave_t=0.; self._wave+=1; self._spawn_wave(WAVE_ADD+self._wave*2)
 
         self._update_hud_dynamic()
         return Task.cont
 
-    # ── HUD ────────────────────────────────────────────────────────────────────
+    # ── 3D HP bars ────────────────────────────────────────────────────────────
+
+    def _make_hp_bar(self, parent: NodePath) -> NodePath:
+        """Create a 3D billboard HP bar above a trooper. Child of parent node."""
+        BAR_W = 0.60   # full width in world units
+        BAR_H = 0.08
+        # Background (dark red trough)
+        vdata,tris,vw,nw,cw = _new_writers()
+        base = vw.getWriteRow()
+        for (vx,vy,vz) in [(-BAR_W/2,-0.02,0),(BAR_W/2,-0.02,0),
+                             (BAR_W/2, 0.06,0),(-BAR_W/2, 0.06,0)]:
+            vw.addData3(vx,vy,vz); nw.addData3(0,-1,0); cw.addData4(0.22,0.06,0.04,0.85)
+        tris.addVertices(base,base+1,base+2); tris.addVertices(base,base+2,base+3)
+        bg = _build_mesh(vdata,tris,two_sided=True)
+
+        # Green fill bar (starts full width, scaled by health)
+        vdata2,tris2,vw2,nw2,cw2 = _new_writers()
+        base2 = vw2.getWriteRow()
+        for (vx,vy,vz) in [(0,0,0),(BAR_W,0,0),(BAR_W,BAR_H,0),(0,BAR_H,0)]:
+            vw2.addData3(vx,vy,vz); nw2.addData3(0,-1,0); cw2.addData4(0.28,0.78,0.22,0.9)
+        tris2.addVertices(base2,base2+1,base2+2); tris2.addVertices(base2,base2+2,base2+3)
+        fill = _build_mesh(vdata2,tris2,two_sided=True)
+
+        # Root pivot — positioned above trooper head, billboards to camera
+        root = parent.attachNewNode("hp_bar_root")
+        root.setPos(0, 0, 2.3)        # above head
+        root.setBillboardAxis()        # rotate around Z to face camera
+        bg.reparentTo(root)
+        bg.setPos(-BAR_W/2, 0.01, 0)
+        fill.reparentTo(root)
+        fill.setPos(-BAR_W/2, 0, 0)
+        fill.setName("hp_fill")
+        return root
+
+    def _update_hp_bar(self, bar_root: NodePath, hp_frac: float):
+        """Scale the fill bar and recolour it."""
+        fill = bar_root.find("**/hp_fill")
+        if fill.isEmpty(): return
+        fill.setScaleX(max(0.01, hp_frac))
+        if hp_frac > 0.5:
+            fill.setColorScale(1.0, 1.0, 1.0, 1.0)
+        elif hp_frac > 0.25:
+            fill.setColorScale(1.4, 1.1, 0.2, 1.0)   # yellow-orange tint
+        else:
+            fill.setColorScale(1.6, 0.3, 0.2, 1.0)   # red tint
+
+    # ── HUD ───────────────────────────────────────────────────────────────────
 
     def _build_hud(self):
-        self._hud_time=OnscreenText(text="",pos=(0,0.92),scale=0.045,
-            fg=(0.82,0.74,0.54,1),shadow=(0,0,0,0.6),mayChange=True,align=TextNode.ACenter)
+        self._hud_time=OnscreenText(text="",pos=(0,.93),scale=.044,
+            fg=(.82,.74,.54,1),shadow=(0,0,0,.6),mayChange=True,align=TextNode.ACenter)
         self._hud_health_bar=DirectWaitBar(text="",value=100,range=100,
-            pos=(-1.1,0,-0.82),frameSize=(0,0.7,-0.025,0.025),
-            frameColor=(0.22,0.08,0.06,0.9),barColor=(0.32,0.78,0.22,1))
-        self._hud_health_lbl=OnscreenText(text="HEALTH",pos=(-1.10,-0.775),scale=0.038,
-            fg=(0.65,0.55,0.40,1),shadow=(0,0,0,0.5),align=TextNode.ALeft)
-        self._hud_troopers=OnscreenText(text="",pos=(-1.10,-0.875),scale=0.040,
-            fg=(0.72,0.64,0.44,1),shadow=(0,0,0,0.5),mayChange=True,align=TextNode.ALeft)
-        self._hud_weapon=OnscreenText(text="Springfield Carbine",pos=(0,-0.80),scale=0.052,
-            fg=(0.72,0.58,0.20,1),shadow=(0,0,0,0.6),mayChange=True,align=TextNode.ACenter)
-        self._hud_ammo=OnscreenText(text="",pos=(0,-0.855),scale=0.048,
-            fg=(0.94,0.92,0.86,1),shadow=(0,0,0,0.6),mayChange=True,align=TextNode.ACenter)
-        self._hud_ammo_res=OnscreenText(text="",pos=(0,-0.905),scale=0.038,
-            fg=(0.65,0.58,0.40,1),shadow=(0,0,0,0.5),mayChange=True,align=TextNode.ACenter)
+            pos=(-1.25,0,-.87),frameSize=(0,.72,-.024,.024),
+            frameColor=(.20,.07,.05,.9),barColor=(.30,.78,.20,1))
+        self._hud_health_lbl=OnscreenText(text="YOUR HEALTH",pos=(-1.25,-.835),scale=.036,
+            fg=(.62,.52,.38,1),shadow=(0,0,0,.5),align=TextNode.ALeft)
+        self._hud_troopers=OnscreenText(text="",pos=(-1.25,-.920),scale=.038,
+            fg=(.70,.62,.42,1),shadow=(0,0,0,.5),mayChange=True,align=TextNode.ALeft)
+        self._hud_weapon=OnscreenText(text="Springfield Carbine",pos=(0,-.83),scale=.050,
+            fg=(.72,.58,.20,1),shadow=(0,0,0,.6),mayChange=True,align=TextNode.ACenter)
+        self._hud_ammo=OnscreenText(text="",pos=(0,-.880),scale=.046,
+            fg=(.94,.92,.86,1),shadow=(0,0,0,.6),mayChange=True,align=TextNode.ACenter)
+        self._hud_ammo_res=OnscreenText(text="",pos=(0,-.926),scale=.036,
+            fg=(.65,.58,.40,1),shadow=(0,0,0,.5),mayChange=True,align=TextNode.ACenter)
         self._hud_reload_bar=DirectWaitBar(text="RELOADING",value=0,range=100,
-            pos=(0,0,-0.945),frameSize=(-0.25,0.25,-0.018,0.018),
-            frameColor=(0.18,0.14,0.06,0.85),barColor=(0.72,0.58,0.20,1))
-        self._hud_kills=OnscreenText(text="0",pos=(1.12,-0.78),scale=0.10,
-            fg=(0.70,0.16,0.09,1),shadow=(0,0,0,0.6),mayChange=True,align=TextNode.ARight)
-        self._hud_kills_lbl=OnscreenText(text="enemies fallen",pos=(1.12,-0.855),scale=0.038,
-            fg=(0.65,0.55,0.40,1),shadow=(0,0,0,0.5),align=TextNode.ARight)
-        self._hud_wave=OnscreenText(text="Wave 1",pos=(1.12,-0.900),scale=0.040,
-            fg=(0.80,0.63,0.30,1),shadow=(0,0,0,0.5),mayChange=True,align=TextNode.ARight)
-        ch=(0.88,0.84,0.72,0.85)
-        self._ch=[OnscreenText(text=t,pos=p,scale=0.04,fg=ch) for t,p in
-                  [("─",(-0.04,0)),("─",(0.04,0)),("│",(0,-0.025)),("│",(0,0.025))]]
+            pos=(0,0,-.962),frameSize=(-.24,.24,-.017,.017),
+            frameColor=(.18,.14,.06,.85),barColor=(.72,.58,.20,1))
+        self._hud_kills=OnscreenText(text="0",pos=(1.28,-.83),scale=.10,
+            fg=(.70,.16,.09,1),shadow=(0,0,0,.6),mayChange=True,align=TextNode.ARight)
+        self._hud_kills_lbl=OnscreenText(text="enemies fallen",pos=(1.28,-.880),scale=.036,
+            fg=(.62,.52,.38,1),shadow=(0,0,0,.5),align=TextNode.ARight)
+        self._hud_wave=OnscreenText(text="Wave 1",pos=(1.28,-.920),scale=.038,
+            fg=(.78,.62,.28,1),shadow=(0,0,0,.5),mayChange=True,align=TextNode.ARight)
+        ch=(.88,.84,.72,.85)
+        self._ch=[OnscreenText(text=t,pos=p,scale=.038,fg=ch) for t,p in
+                  [("-",(-.045,-.008)),("-",(.018,-.008)),
+                   ("|",(-.006,-.032)),("|",(-.006,.018))]]
         self._hud_hint=OnscreenText(
             text="[Tab] switch weapon   [R] reload   Mouse = look",
-            pos=(0,-0.960),scale=0.033,fg=(0.50,0.44,0.32,0.8),
-            shadow=(0,0,0,0.4),align=TextNode.ACenter)
-        # Asset status indicator
-        status_txt = "[assets] models loaded — per-pixel lighting ON" if self._using_assets \
-                     else "[assets] no models — using procedural geometry"
-        self._hud_asset_status=OnscreenText(text=status_txt,pos=(0,0.84),scale=0.030,
-            fg=(0.5,0.7,0.4,0.8) if self._using_assets else (0.7,0.5,0.3,0.7),
-            shadow=(0,0,0,0.4),align=TextNode.ACenter,mayChange=False)
+            pos=(0,-.972),scale=.031,fg=(.48,.42,.30,.8),
+            shadow=(0,0,0,.4),align=TextNode.ACenter)
         self._hud_all=[self._hud_time,self._hud_health_bar,self._hud_health_lbl,
             self._hud_troopers,self._hud_weapon,self._hud_ammo,self._hud_ammo_res,
             self._hud_reload_bar,self._hud_kills,self._hud_kills_lbl,self._hud_wave,
-            self._hud_hint,self._hud_asset_status,*self._ch]
-        self._set_hud_visible(False)
-        self._overlay_np=None
+            self._hud_hint,*self._ch]
+        self._set_hud_visible(False); self._overlay_np=None
 
     def _set_hud_visible(self,v):
         for h in self._hud_all: h.show() if v else h.hide()
 
     def _update_hud_weapon(self):
-        name="Springfield Carbine" if self._weapon==WeaponType.CARBINE else "Colt Revolver"
-        self._hud_weapon.setText(name); self._update_hud_ammo()
+        n="Springfield Carbine" if self._weapon==WeaponType.CARBINE else "Colt Revolver"
+        self._hud_weapon.setText(n); self._update_hud_ammo()
 
     def _update_hud_ammo(self):
         if self._weapon==WeaponType.CARBINE:
-            atxt="LOADED" if self._carb_loaded>0 else "— EMPTY —"
-            rtxt=f"Reserve: {self._carb_ammo} rds"
-            acol=(0.94,0.92,0.86,1) if self._carb_loaded>0 else (0.80,0.20,0.12,1)
+            at="LOADED" if self._carb_loaded>0 else "-- EMPTY --"
+            rt=f"Reserve: {self._carb_ammo} rds"
+            ac=(.94,.92,.86,1) if self._carb_loaded>0 else (.80,.20,.12,1)
         else:
-            atxt="| "*self._colt_loaded+"  "*(COLT_CAP-self._colt_loaded)
-            rtxt=f"Reserve: {self._colt_ammo} rds"; acol=(0.72,0.58,0.20,1) if self._colt_loaded>1 else (0.80,0.20,0.12,1)
-        self._hud_ammo.setText(atxt); self._hud_ammo.setFg(acol); self._hud_ammo_res.setText(rtxt)
+            at="| "*self._colt_loaded+"  "*(COLT_CAP-self._colt_loaded)
+            rt=f"Reserve: {self._colt_ammo} rds"
+            ac=(.72,.58,.20,1) if self._colt_loaded>1 else (.80,.20,.12,1)
+        self._hud_ammo.setText(at); self._hud_ammo.setFg(ac); self._hud_ammo_res.setText(rt)
 
     def _update_hud_dynamic(self):
-        mins=int(self._elapsed//60); secs=int(self._elapsed%60)
-        self._hud_time.setText(f"25 June 1876  —  Little Bighorn, Montana  —  {mins:02d}:{secs:02d}")
+        m=int(self._elapsed//60); s=int(self._elapsed%60)
+        self._hud_time.setText(f"25 June 1876  --  Little Bighorn, Montana  --  {m:02d}:{s:02d}")
         hp=max(0,self._hp); self._hud_health_bar["value"]=hp
         self._hud_health_bar["barColor"]=(
-            (0.28,0.78,0.22,1) if hp>50 else (0.86,0.62,0.08,1) if hp>25 else (0.80,0.15,0.10,1))
-        self._hud_troopers.setText(f"7th Cavalry:  {sum(1 for t in self._troopers if t.alive)} troopers")
+            (.28,.78,.22,1) if hp>50 else (.86,.62,.08,1) if hp>25 else (.80,.15,.10,1))
+        alive_t=sum(1 for t in self._troopers if t.alive)
+        self._hud_troopers.setText(f"7th Cavalry:  {alive_t} / {TROOPER_COUNT} troopers")
         self._hud_kills.setText(str(self._kills)); self._hud_wave.setText(f"Wave {self._wave}")
 
-    # ── Overlays ───────────────────────────────────────────────────────────────
+    # ── Overlays ──────────────────────────────────────────────────────────────
 
     def _clear_overlay(self):
         if self._overlay_np: self._overlay_np.removeNode(); self._overlay_np=None
 
     def _show_title(self):
+        # HP bars are 3D children of trooper nodes — hidden with entity root
         self._clear_overlay(); self._set_hud_visible(False)
-        f=DirectFrame(frameColor=(0.06,0.04,0.02,0.90),frameSize=(-1.4,1.4,-1.0,1.0))
+        if hasattr(self,"_vm_carbine"): self._vm_carbine.hide()
+        if hasattr(self,"_vm_colt"):    self._vm_colt.hide()
+        f=DirectFrame(frameColor=(.06,.04,.02,.92),frameSize=(-1.4,1.4,-1.,.9))
         self._overlay_np=f
-        asset_note = ("3D models loaded — per-pixel lighting active" if self._using_assets
-                      else f"No models found — drop .glb files into: models/")
         rows=[
-            ("LITTLE BIGHORN",                        0.72,(0.72,0.16,0.09,1),0.20),
-            ("LAST STAND",                            0.45,(0.90,0.82,0.65,1),0.20),
-            ("25 June 1876 — Montana Territory",      0.14,(0.72,0.63,0.43,1),0.065),
-            ("Custer's 7th Cavalry are surrounded.",  0.00,(0.65,0.58,0.40,1),0.050),
-            ("Survive as long as you can.",          -0.08,(0.65,0.58,0.40,1),0.050),
-            ("There are no reinforcements.",         -0.16,(0.65,0.58,0.40,1),0.050),
-            ("WASD — Move   Mouse — Look   Click/Space — Fire",
-                                                     -0.34,(0.52,0.46,0.32,1),0.042),
-            ("R — Reload     Tab — Switch weapon",   -0.42,(0.52,0.46,0.32,1),0.042),
-            (asset_note,                             -0.58,
-             (0.40,0.65,0.35,0.9) if self._using_assets else (0.60,0.50,0.30,0.8), 0.035),
-            ("[SPACE]  to begin",                    -0.75,(0.72,0.58,0.20,1),0.072),
+            ("LITTLE BIGHORN",                        .72,(.72,.16,.09,1),.20),
+            ("LAST STAND",                            .46,(.90,.82,.65,1),.20),
+            ("25 June 1876 -- Montana Territory",     .14,(.72,.63,.43,1),.065),
+            ("Custer's 7th Cavalry are surrounded.",  .00,(.65,.58,.40,1),.050),
+            ("Hold out as long as you can.",         -.08,(.65,.58,.40,1),.050),
+            ("Each trooper has his own health.",     -.16,(.65,.58,.40,1),.050),
+            ("Game over when the last man falls.",   -.24,(.65,.58,.40,1),.050),
+            ("WASD -- Move   Mouse -- Look   Click/Space -- Fire",-.38,(.52,.46,.32,1),.042),
+            ("R -- Reload     Tab -- Switch weapon", -.46,(.52,.46,.32,1),.042),
+            ("[SPACE]  to begin",                    -.72,(.72,.58,.20,1),.072),
         ]
         for txt,y,col,sc in rows:
             OnscreenText(text=txt,pos=(0,y),scale=sc,fg=col,
-                         shadow=(0,0,0,0.6),parent=f,align=TextNode.ACenter)
+                         shadow=(0,0,0,.6),parent=f,align=TextNode.ACenter)
         self.accept("space",self._begin_game)
 
     def _begin_game(self):
@@ -902,24 +1233,26 @@ class LittleBighornGame(ShowBase):
 
     def _show_gameover(self):
         self._set_hud_visible(False); self._clear_overlay()
-        mins=int(self._elapsed//60); secs=int(self._elapsed%60)
-        f=DirectFrame(frameColor=(0.04,0.02,0.01,0.92),frameSize=(-1.4,1.4,-1.0,1.0))
+        m=int(self._elapsed//60); s=int(self._elapsed%60)
+        f=DirectFrame(frameColor=(.04,.02,.01,.93),frameSize=(-1.4,1.4,-1.,.9))
         self._overlay_np=f
+        alive_t=sum(1 for t in self._troopers if t.alive)
         rows=[
-            ("THE 7TH CAVALRY FALLS",                  0.72,(0.72,0.16,0.09,1),0.18),
-            (f"Survived:  {mins} min {secs:02d} sec",  0.44,(0.90,0.82,0.65,1),0.090),
-            (f"Enemies fallen:  {self._kills}",         0.30,(0.90,0.82,0.65,1),0.090),
-            ('"We shall never meet again."',             0.06,(0.72,0.63,0.43,1),0.058),
-            ("— Attributed to Custer, final dispatch", -0.04,(0.55,0.46,0.30,1),0.040),
+            ("THE 7TH CAVALRY FALLS",                  .72,(.72,.16,.09,1),.18),
+            (f"Survived:  {m} min {s:02d} sec",         .44,(.90,.82,.65,1),.090),
+            (f"Enemies fallen:  {self._kills}",          .30,(.90,.82,.65,1),.090),
+            (f"Troopers standing:  {alive_t} / {TROOPER_COUNT}", .16,(.72,.62,.40,1),.060),
+            ('"We shall never meet again."',              .00,(.72,.63,.43,1),.055),
+            ("-- Attributed to Custer, final dispatch", -.10,(.55,.46,.30,1),.038),
             ("Lakota/Cheyenne carried Winchester 1873 repeating rifles,",
-                                                       -0.22,(0.65,0.58,0.40,1),0.038),
+                                                        -.26,(.65,.58,.40,1),.036),
             ("outgunning Custer's single-shot Springfield carbines.",
-                                                       -0.30,(0.65,0.58,0.40,1),0.038),
-            ("[SPACE] play again     [ESC] quit",       -0.70,(0.55,0.46,0.32,1),0.058),
+                                                        -.34,(.65,.58,.40,1),.036),
+            ("[SPACE] play again     [ESC] quit",        -.72,(.55,.46,.32,1),.058),
         ]
         for txt,y,col,sc in rows:
             OnscreenText(text=txt,pos=(0,y),scale=sc,fg=col,
-                         shadow=(0,0,0,0.6),parent=f,align=TextNode.ACenter)
+                         shadow=(0,0,0,.6),parent=f,align=TextNode.ACenter)
         self.accept("space",self._begin_game)
 
 
