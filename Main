@@ -48,10 +48,15 @@ loadPrcFileData("", """
 SCRIPT_DIR = Path(__file__).parent
 MODELS_DIR = SCRIPT_DIR / "models"
 MODEL_CFG  = {
-    "trooper": (1.0, 0.0,   0.0),
-    "horse":   (1.0, 0.0,   0.0),
-    "warrior": (1.0, 1.85,  0.0),
-    "dead":    (1.0, 0.0,   0.0),
+    # (scale, z_offset, h_rotation_degrees)
+    # scale    — makes character ~1.9 world units tall
+    # z_offset — raises feet to Z=0
+    # h_rot    — 0 if facing forward, 180 if backward
+    "trooper": (0.01198, 0.6611, 0.0),   # scale/z_offset/h_rotation
+    # If model still lies flat, it needs a pitch fix — applied in _make_trooper
+    "horse":   (1.0,     0.0,   0.0),
+    "warrior": (1.0,     1.85,  0.0),
+    "dead":    (1.0,     0.0,   0.0),
 }
 
 # ── Constants ──────────────────────────────────────────────────────────────────
@@ -174,9 +179,9 @@ def make_horse_articulated(parent: NodePath) -> NodePath:
 # ── Articulated trooper — named arm node for aim animation ────────────────────
 
 def make_trooper_articulated(parent: NodePath) -> NodePath:
-    """Union 7th Cavalry trooper. Height ~2.0u. Feet at Z=0.
-    Iteration 3: slimmer boots, visible leg gap, coat detail, face features,
-    rifle rests on shoulder at parade rest by default."""
+    """Union 7th Cavalry trooper. Height ~2.1u. Feet at Z=0.
+    Iteration 4: multi-slice limbs for curvature, per-face colour variation,
+    tapered thighs/calves, epaulettes, waist nip."""
     root = parent.attachNewNode("trooper_root")
 
     def B(cx,cy,cz,sx,sy,sz,r,g,b):
@@ -184,89 +189,134 @@ def make_trooper_articulated(parent: NodePath) -> NodePath:
         _box_tris(tris,_add_box(vw,nw,cw,cx,cy,cz,sx,sy,sz,r,g,b))
         _build_mesh(vdata,tris).reparentTo(root)
 
-    # ── Boots  0.00-0.22  (slimmer, less dominant) ────────────
-    B(-0.09, 0.11, 0.01,  0.15, 0.22, 0.18,  32,20,10)
-    B( 0.09, 0.11, 0.01,  0.15, 0.22, 0.18,  32,20,10)
+    # ── BOOTS  0.00-0.24 ─────────────────────────────────────
+    # Three slices per boot simulate tapered shape
+    B(-0.09, 0.06, 0.01,  0.16, 0.12, 0.20,  28,18, 8)   # sole/ankle
+    B(-0.09, 0.14, 0.01,  0.14, 0.10, 0.18,  32,21,10)   # mid boot
+    B(-0.09, 0.21, 0.01,  0.13, 0.08, 0.17,  36,24,12)   # top (lighter = highlight)
+    B( 0.09, 0.06, 0.01,  0.16, 0.12, 0.20,  28,18, 8)
+    B( 0.09, 0.14, 0.01,  0.14, 0.10, 0.18,  32,21,10)
+    B( 0.09, 0.21, 0.01,  0.13, 0.08, 0.17,  36,24,12)
 
-    # ── Trousers  0.20-0.90  (clear gap between legs) ─────────
-    B(-0.09, 0.55, 0.00,  0.15, 0.70, 0.16,  52,65,90)
-    B( 0.09, 0.55, 0.00,  0.15, 0.70, 0.16,  52,65,90)
-    # Yellow seam stripe
-    B(-0.17, 0.55, 0.00,  0.02, 0.68, 0.02, 192,158,44)
-    B( 0.17, 0.55, 0.00,  0.02, 0.68, 0.02, 192,158,44)
+    # ── CALVES  0.22-0.62 ────────────────────────────────────
+    # Taper: wider at knee, narrow at ankle
+    B(-0.09, 0.34, 0.00,  0.14, 0.22, 0.15,  52,65,90)   # lower calf
+    B(-0.09, 0.52, 0.00,  0.15, 0.20, 0.16,  54,67,92)   # upper calf/knee
+    B( 0.09, 0.34, 0.00,  0.14, 0.22, 0.15,  52,65,90)
+    B( 0.09, 0.52, 0.00,  0.15, 0.20, 0.16,  54,67,92)
 
-    # ── Coat/Torso  0.88-1.44 ─────────────────────────────────
-    # Hip section
-    B( 0.00, 0.98, 0.00,  0.36, 0.20, 0.22,  42,60,82)
-    # Mid chest
-    B( 0.00, 1.16, 0.00,  0.38, 0.24, 0.22,  44,62,84)
-    # Shoulder/upper chest — widest point
-    B( 0.00, 1.33, 0.00,  0.42, 0.22, 0.22,  46,64,86)
-    # Dark blue collar
-    B( 0.00, 1.43, 0.00,  0.28, 0.06, 0.20,  28,38,58)
+    # ── THIGHS  0.60-0.94 — wider, slightly darker ────────────
+    B(-0.09, 0.77, 0.00,  0.17, 0.34, 0.17,  48,60,86)
+    B( 0.09, 0.77, 0.00,  0.17, 0.34, 0.17,  48,60,86)
+    # Yellow cavalry stripe — runs full leg length
+    B(-0.18, 0.60, 0.00,  0.02, 0.88, 0.02, 192,158,44)
+    B( 0.18, 0.60, 0.00,  0.02, 0.88, 0.02, 192,158,44)
+
+    # ── HIPS/WAIST  0.92-1.04 — nipped in ────────────────────
+    B( 0.00, 0.98, 0.00,  0.32, 0.12, 0.20,  40,58,80)
     # Belt
-    B( 0.00, 0.90, 0.00,  0.38, 0.05, 0.24, 148,118,40)
+    B( 0.00, 0.93, 0.00,  0.36, 0.05, 0.22, 148,118,40)
     # Cartridge box
-    B( 0.16, 0.92, 0.12,  0.09, 0.08, 0.06,  22,14, 8)
-    # Three brass buttons
-    for by in [1.02, 1.14, 1.26]:
-        B(0.00, by, 0.12,  0.04, 0.04, 0.03, 190,158,46)
-    # Dark lapel V-shape on chest
-    B(-0.06, 1.22, 0.12,  0.06, 0.22, 0.02,  30,42,62)
-    B( 0.06, 1.22, 0.12,  0.06, 0.22, 0.02,  30,42,62)
+    B( 0.15, 0.95, 0.12,  0.09, 0.08, 0.06,  22,14, 8)
 
-    # ── Left arm  0.94-1.38 (resting at side) ─────────────────
-    B(-0.26, 1.15, 0.00,  0.13, 0.44, 0.14,  44,62,84)
-    B(-0.26, 0.93, 0.00,  0.12, 0.14, 0.13, 205,168,122)
+    # ── LOWER COAT  1.02-1.22 — flares out from waist ─────────
+    B( 0.00, 1.12, 0.00,  0.38, 0.20, 0.22,  42,60,82)
 
-    # ── Neck  1.42-1.52 ───────────────────────────────────────
-    B( 0.00, 1.47, 0.00,  0.13, 0.10, 0.12, 200,162,118)
+    # ── CHEST  1.20-1.44 — widest, darker sides ───────────────
+    B( 0.00, 1.30, 0.00,  0.40, 0.24, 0.22,  44,63,85)   # front face
+    # Chest sides slightly darker for depth
+    B(-0.18, 1.30, 0.00,  0.04, 0.22, 0.20,  36,54,76)
+    B( 0.18, 1.30, 0.00,  0.04, 0.22, 0.20,  36,54,76)
 
-    # ── Head  1.50-1.78 ───────────────────────────────────────
-    B( 0.00, 1.64, 0.00,  0.26, 0.28, 0.22, 205,168,122)
-    # Eyes — dark dots on front face
-    B(-0.07, 1.68, 0.12,  0.05, 0.04, 0.02,  45,30,20)
-    B( 0.07, 1.68, 0.12,  0.05, 0.04, 0.02,  45,30,20)
+    # ── COLLAR  1.42-1.48 ─────────────────────────────────────
+    B( 0.00, 1.45, 0.00,  0.26, 0.06, 0.18,  28,40,62)
+
+    # ── COAT DETAILS ──────────────────────────────────────────
+    # Lapel V on chest — dark blue piping
+    B(-0.05, 1.18, 0.12,  0.05, 0.20, 0.02,  28,40,62)
+    B( 0.05, 1.18, 0.12,  0.05, 0.20, 0.02,  28,40,62)
+    # Brass buttons x4
+    for by in [1.06, 1.16, 1.26, 1.36]:
+        B(0.00, by, 0.12,  0.04, 0.04, 0.02, 192,160,48)
+
+    # ── EPAULETTES — shoulder boards ─────────────────────────
+    B(-0.22, 1.42, 0.00,  0.12, 0.05, 0.18,  30,45,72)   # left
+    B( 0.22, 1.42, 0.00,  0.12, 0.05, 0.18,  30,45,72)   # right
+    # Gold trim on epaulette
+    B(-0.22, 1.42, 0.00,  0.12, 0.04, 0.18, 160,130,40)
+    B( 0.22, 1.42, 0.00,  0.12, 0.04, 0.18, 160,130,40)
+
+    # ── LEFT ARM  1.00-1.42 ────────────────────────────────────
+    # Upper arm — two slices for taper
+    B(-0.26, 1.30, 0.00,  0.13, 0.22, 0.14,  44,62,84)   # shoulder
+    B(-0.26, 1.12, 0.00,  0.12, 0.20, 0.13,  42,60,82)   # lower arm
+    # Cuff
+    B(-0.26, 0.99, 0.00,  0.13, 0.06, 0.14,  28,40,62)
+    # Hand
+    B(-0.26, 0.93, 0.00,  0.12, 0.10, 0.12, 205,168,122)
+
+    # ── NECK  1.46-1.54 ───────────────────────────────────────
+    B( 0.00, 1.50, 0.00,  0.13, 0.10, 0.12, 200,162,118)
+
+    # ── HEAD  1.52-1.80 ───────────────────────────────────────
+    # Main head box
+    B( 0.00, 1.66, 0.00,  0.26, 0.28, 0.22, 208,172,126)
+    # Slightly darker sides for roundness illusion
+    B(-0.12, 1.66, 0.00,  0.02, 0.26, 0.20, 185,148,108)
+    B( 0.12, 1.66, 0.00,  0.02, 0.26, 0.20, 185,148,108)
+    # Forehead slightly lighter
+    B( 0.00, 1.73, 0.08,  0.22, 0.10, 0.06, 218,182,136)
+    # Eyes
+    B(-0.07, 1.68, 0.12,  0.05, 0.04, 0.02,  40,28,18)
+    B( 0.07, 1.68, 0.12,  0.05, 0.04, 0.02,  40,28,18)
+    # Eye whites (tiny)
+    B(-0.07, 1.68, 0.13,  0.03, 0.03, 0.01, 220,215,200)
+    B( 0.07, 1.68, 0.13,  0.03, 0.03, 0.01, 220,215,200)
     # Nose
-    B( 0.00, 1.62, 0.12,  0.04, 0.04, 0.02, 185,145,100)
-    # Mouth / chin shadow
-    B( 0.00, 1.55, 0.11,  0.08, 0.03, 0.02, 170,125,90)
-    # Moustache (Custer-style)
-    B( 0.00, 1.59, 0.12,  0.10, 0.03, 0.02,  80,50,30)
+    B( 0.00, 1.63, 0.12,  0.04, 0.05, 0.03, 188,148,105)
+    # Moustache
+    B( 0.00, 1.59, 0.12,  0.10, 0.03, 0.02,  75,48,28)
+    # Jaw/chin slightly darker
+    B( 0.00, 1.55, 0.00,  0.22, 0.06, 0.18, 188,152,112)
+    # Ear nubs
+    B(-0.14, 1.66, 0.00,  0.02, 0.08, 0.08, 195,158,118)
+    B( 0.14, 1.66, 0.00,  0.02, 0.08, 0.08, 195,158,118)
 
-    # ── Campaign hat  1.76-1.96 ────────────────────────────────
-    B( 0.00, 1.78, 0.00,  0.36, 0.04, 0.34,  18,12, 6)  # brim
-    B( 0.00, 1.87, 0.00,  0.22, 0.18, 0.22,  18,12, 6)  # crown
-    B( 0.00, 1.78, 0.00,  0.24, 0.04, 0.24, 152,120,42)  # gold band
+    # ── HAIR (sides of head, dark) ─────────────────────────────
+    B(-0.12, 1.62, -0.04,  0.04, 0.14, 0.14,  65,42,22)
+    B( 0.12, 1.62, -0.04,  0.04, 0.14, 0.14,  65,42,22)
 
-    # ── Right arm — pivot at shoulder, rifle at parade rest ────
-    # Shoulder is at Z=1.38 in root space
+    # ── CAMPAIGN HAT  1.78-1.98 ────────────────────────────────
+    B( 0.00, 1.78, 0.00,  0.36, 0.04, 0.34,  16,10, 5)   # brim
+    B( 0.00, 1.79, 0.00,  0.24, 0.04, 0.24, 150,118,42)  # gold band on brim
+    B( 0.00, 1.87, 0.00,  0.22, 0.16, 0.22,  16,10, 5)   # crown
+    # Crown slightly lighter front face
+    B( 0.00, 1.87, 0.12,  0.20, 0.14, 0.02,  24,16, 9)
+
+    # ── RIGHT ARM + RIFLE (pivot at shoulder) ──────────────────
     arm_pivot = root.attachNewNode("right_arm")
-    arm_pivot.setPos(0.25, 0.00, 1.38)
+    arm_pivot.setPos(0.24, 0.00, 1.42)   # at epaulette/shoulder
 
     vdata,tris,vw,nw,cw=_new_writers()
-    # Upper arm (hangs down from shoulder pivot)
-    _box_tris(tris,_add_box(vw,nw,cw,
-        0.00, -0.22, 0.00,   0.13, 0.44, 0.14,  44,62,84))
-    # Forearm + hand
-    _box_tris(tris,_add_box(vw,nw,cw,
-        0.00, -0.44, 0.00,   0.12, 0.14, 0.12,  205,168,122))
-    # Springfield carbine — stock at hand, barrel upward along arm axis
-    # Stock (at hand level)
-    _box_tris(tris,_add_box(vw,nw,cw,
-        0.01, -0.38, 0.06,   0.06, 0.28, 0.06,  65,48,22))
-    # Receiver
-    _box_tris(tris,_add_box(vw,nw,cw,
-        0.01, -0.12, 0.07,   0.06, 0.16, 0.08,  50,46,40))
-    # Barrel — extends upward past shoulder
-    _box_tris(tris,_add_box(vw,nw,cw,
-        0.01,  0.20, 0.07,   0.04, 0.80, 0.04,  38,34,30))
+    # Upper arm — two slices
+    _box_tris(tris,_add_box(vw,nw,cw, 0.00,-0.12,0.00, 0.13,0.22,0.14, 44,62,84))
+    _box_tris(tris,_add_box(vw,nw,cw, 0.00,-0.30,0.00, 0.12,0.20,0.13, 42,60,82))
+    # Cuff
+    _box_tris(tris,_add_box(vw,nw,cw, 0.00,-0.42,0.00, 0.13,0.06,0.14, 28,40,62))
+    # Hand gripping stock
+    _box_tris(tris,_add_box(vw,nw,cw, 0.00,-0.50,0.00, 0.12,0.10,0.12, 205,168,122))
+    # Springfield stock (walnut)
+    _box_tris(tris,_add_box(vw,nw,cw, 0.01,-0.40,0.08, 0.06,0.24,0.06,  68,50,24))
+    # Lock/receiver
+    _box_tris(tris,_add_box(vw,nw,cw, 0.01,-0.18,0.09, 0.06,0.16,0.08,  52,48,44))
+    # Barrel — up past head
+    _box_tris(tris,_add_box(vw,nw,cw, 0.01, 0.10,0.09, 0.04,0.80,0.04,  38,35,32))
+    # Barrel band (metal ring)
+    _box_tris(tris,_add_box(vw,nw,cw, 0.01, 0.06,0.09, 0.05,0.04,0.05,  55,52,48))
     arm_mesh=_build_mesh(vdata,tris); arm_mesh.reparentTo(arm_pivot)
 
     return root
 
-
-# ── Warrior rider model ────────────────────────────────────────────────────────
 
 def make_warrior_model_proc() -> NodePath:
     vdata,tris,vw,nw,cw=_new_writers()
@@ -671,9 +721,10 @@ class LittleBighornGame(ShowBase):
     def _setup_post_fx(self):
         try:
             f=CommonFilters(self.win,self.cam)
-            f.setBloom(blend=(.3,.4,.3,0),mintrigger=0.72,maxtrigger=1.,desat=0.4,intensity=1.2,size="medium")
-            f.setAmbientOcclusion(numsamples=16,radius=0.025,amount=2.2,strength=0.6,falloff=0.0002)
-            self._filters=f; print("[render] Post-FX: bloom + SSAO")
+            # Bloom only — SSAO disabled (creates dark halos around models)
+            f.setBloom(blend=(.3,.4,.3,0),mintrigger=0.78,maxtrigger=1.,
+                       desat=0.3,intensity=0.8,size="small")
+            self._filters=f; print("[render] Post-FX: bloom enabled")
         except Exception as e:
             print(f"[render] Post-FX unavailable: {e}"); self._filters=None
 
@@ -709,17 +760,19 @@ class LittleBighornGame(ShowBase):
     # ── Asset loading ──────────────────────────────────────────────────────────
 
     def _load_models(self):
+        from panda3d.core import Filename
         MODELS_DIR.mkdir(exist_ok=True); found=False
         for key in ("trooper","horse","warrior","dead"):
             for ext in (".glb",".gltf",".egg",".bam"):
                 path=MODELS_DIR/(key+ext)
                 if path.exists():
                     try:
-                        mdl=self.loader.loadModel(str(path))
+                        # Convert OS path to Panda3D virtual path
+                        panda_path = Filename.fromOsSpecific(str(path.resolve()))
+                        mdl=self.loader.loadModel(panda_path)
                         if mdl:
-                            sc,zo,ho=MODEL_CFG.get(key,(1.,0.,0.))
-                            mdl.setScale(sc); mdl.setZ(zo); mdl.setH(ho)
-                            self._mdl_cache[key]=mdl; mdl.detachNode()
+                            mdl.detachNode()
+                            self._mdl_cache[key]=mdl
                             found=True; print(f"[assets] {key} <- {path.name}"); break
                     except Exception as e: print(f"[assets] {key}: {e}")
         if found: self._using_assets=True; print("[assets] shading active")
@@ -728,8 +781,18 @@ class LittleBighornGame(ShowBase):
     def _make_trooper(self,parent) -> tuple:
         """Returns (root_np, arm_pivot_np)."""
         if "trooper" in self._mdl_cache:
-            np=self._mdl_cache["trooper"].copyTo(parent)
-            return np, None
+            sc,zo,ho = MODEL_CFG.get("trooper",(1.,0.,0.))
+            inst = parent.attachNewNode("trooper_asset")
+            copy = self._mdl_cache["trooper"].copyTo(inst)
+            copy.setScale(sc)
+            # Fix Y-up models: rotate -90 pitch so model stands upright
+            copy.setHpr(ho, 90, 0)
+            # Clear any inherited light-off, then re-apply scene lights
+            # Remove setLightOff override so scene lights reach this model
+            copy.setLightOff(False)
+            copy.clearLight()
+            inst.setZ(zo)
+            return inst, None
         root=make_trooper_articulated(parent)
         arm=root.find("**/right_arm")
         return root, (arm if not arm.isEmpty() else None)
@@ -783,7 +846,11 @@ class LittleBighornGame(ShowBase):
             ang=i/TROOPER_COUNT*math.pi*2; d=rng.uniform(2.5,5.)
             tx=math.cos(ang)*d; tz=math.sin(ang)*d
             np,arm=self._make_trooper(self._entity_root)
-            th=self._terrain_height(tx,tz); np.setPos(tx,tz,th)
+            th=self._terrain_height(tx,tz)
+            # setX/setY preserves the Z offset set by _make_trooper
+            np.setX(tx); np.setY(tz)
+            # Add terrain height to the existing Z offset
+            np.setZ(np.getZ() + th)
             self._troopers.append(TrooperEnt(x=tx,y=tz,np=np,arm_np=arm))
         self._spawn_wave(INIT_ENEMIES)
         self._cam_x=0.;self._cam_z=0.;self._yaw=0.;self._pitch=0.
@@ -857,6 +924,13 @@ class LittleBighornGame(ShowBase):
     # ── Update ────────────────────────────────────────────────────────────────
 
     def _update_task(self,task):
+        try:
+            return self._update_task_inner(task)
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            return Task.cont
+
+    def _update_task_inner(self,task):
         dt=min(globalClock.getDt(),.05)
         if self._state in ("title","gameover"): return Task.cont
 
@@ -980,7 +1054,8 @@ class LittleBighornGame(ShowBase):
                             if t.np:
                                 t.np.removeNode(); t.np=None
                                 dead=self._make_dead(self._entity_root)
-                                dead.setPos(t.x,t.y,self._terrain_height(t.x,t.y))
+                                dh=self._terrain_height(t.x,t.y)
+                                dead.setPos(t.x,t.y,dh)
                             # Last trooper dead + player dead = game over
                             if self._hp<=0 or not any(tr.alive for tr in self._troopers):
                                 self._state="gameover"; self._show_gameover()
